@@ -179,8 +179,6 @@ A single-screen progress dashboard (workspace LOC, module weights, BIP coverage,
 ./scripts/dashboard.sh --rpc http://user:pass@host:port
 ./scripts/dashboard.sh --plain         # disable ANSI colour
 ```
-<img width="1748" height="1912" alt="BitcoinPR" src="https://github.com/user-attachments/assets/ce7b86ee-f92b-4dc6-bc74-4b25b5404161" />
-
 
 ## Building
 

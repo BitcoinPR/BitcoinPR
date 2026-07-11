@@ -4,9 +4,10 @@ Completed work lives in [CHANGELOG.md](CHANGELOG.md).
 
 ## Pending Work
 
-### BIP-110 Bare-Envelope Parasite Filter (parked — PR #45, formerly #44)
+### BIP-110 Bare-Envelope Parasite Filter (parked — BitcoinPR/BitcoinPR#1)
 
-- [ ] **Merge PR #45 (`claude/bip110-bare-envelope-filter`) if/when BIP-110
+- [ ] **Merge [BitcoinPR/BitcoinPR#1](https://github.com/BitcoinPR/BitcoinPR/pull/1)
+  (branch `bip110-bare-envelope-filter`) if/when BIP-110
   activates** — mirrors Bitcoin Knots PR #319: ordinals (ord#4545) announced a
   BIP-110-compatible envelope (`<marker> <data>… OP_2DROP…OP_DROP`, no
   `OP_IF`) that evades classic envelope detection. The branch extends
