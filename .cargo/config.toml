@@ -1,0 +1,7 @@
+[env]
+# Force libz-sys to use system zlib instead of vendored source.
+# rocksdb v0.24 enables the "static" feature on librocksdb-sys which cascades
+# to libz-sys trying to compile bundled zlib source that may be missing from
+# the crates.io tarball (git submodule not included). Setting this to "0"
+# overrides that preference and links against the system zlib (zlib1g-dev).
+LIBZ_SYS_STATIC = "0"

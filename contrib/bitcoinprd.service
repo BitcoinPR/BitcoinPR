@@ -1,0 +1,26 @@
+[Unit]
+Description=BitcoinPR full node daemon
+Documentation=https://github.com/brashratel/bitcoinpr
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bitcoinprd --datadir=/var/lib/bitcoinpr
+ExecStop=/usr/bin/curl -s --user bitcoinpr:bitcoinpr --data-binary '{"jsonrpc":"1.0","method":"stop","params":[]}' http://127.0.0.1:8332/
+User=bitcoinpr
+Group=bitcoinpr
+RuntimeDirectory=bitcoinpr
+StateDirectory=bitcoinpr
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=60
+
+# Hardening
+PrivateTmp=true
+ProtectSystem=full
+NoNewPrivileges=true
+MemoryDenyWriteExecute=false
+
+[Install]
+WantedBy=multi-user.target

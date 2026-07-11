@@ -1,0 +1,16 @@
+data/
+target/
+target-docker/
+# cargo-fuzz build artifacts, corpora, and crash inputs (multi-GB, not needed
+# in the image build context).
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+logs/
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+.git/

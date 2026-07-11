@@ -1,0 +1,21 @@
+services:
+  signet:
+    build:
+      context: .
+      args:
+        FEATURES: "full"
+    command: >
+      --network signet --datadir /data/bitcoinpr
+      --rpcbind 0.0.0.0 --rpcuser bitcoinpr --rpcpassword bitcoinpr
+      --port 38333
+      --txindex
+      --index
+    ports:
+      - "38332:38332"
+      - "38333:38333"
+      - "33333:33333"
+      - "3003:3000"
+    mem_limit: 1g
+    volumes:
+      - /data/BitcoinPR:/data/bitcoinpr
+    restart: unless-stopped

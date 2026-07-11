@@ -1,0 +1,17 @@
+/target
+/target-docker
+Cargo.lock
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.dat
+# Top-level runtime/cluster data only — keep nested test vectors (e.g.
+# bitcoinpr-core/tests/data/) tracked.
+/data/
+logs/
+
+# Container CARGO_HOME mounted during builds
+.cargo-home/
+__pycache__/

@@ -1,0 +1,22 @@
+[package]
+name = "bitcoinpr-rpc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bitcoinpr-core = { path = "../bitcoinpr-core" }
+bitcoinpr-storage = { path = "../bitcoinpr-storage" }
+bitcoinpr-p2p = { path = "../bitcoinpr-p2p" }
+bitcoin.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+jsonrpsee.workspace = true
+anyhow.workspace = true
+# HTTP Basic auth middleware. tower 0.4 / http 1 match jsonrpsee 0.24's versions
+# so the ServiceBuilder type unifies with `set_http_middleware`.
+tower = "0.4"
+http = "1"
+base64 = "0.22"

@@ -1,0 +1,260 @@
+# docker-compose.interop.yml
+#
+# 6-node Bitcoin regtest interoperability cluster
+#
+# Nodes:
+#   bitcoinpr1     — BitcoinPR seed/miner    RPC: localhost:18443  P2P: 18444  Web: localhost:3000  Stratum: localhost:3333
+#   bitcoinpr2     — BitcoinPR validator     RPC: localhost:28443
+#   bitcoin-core  — Bitcoin Core           RPC: localhost:38443
+#   bitcoin-knots — Bitcoin Knots          RPC: localhost:48443
+#   btcd          — btcd (Go) sync node    RPC: localhost:58443
+#   libbitcoin    — Libbitcoin Server      ZMQ: localhost:59091/59092
+#
+# All nodes connect to bitcoinpr1 as their initial peer.
+# Data is stored under DATA_DIR (default: ./data/interop/).
+#
+# Usage:
+#   docker compose -f docker-compose.interop.yml up -d
+#   docker compose -f docker-compose.interop.yml down
+#   DATA_DIR=/mnt/ssd docker compose -f docker-compose.interop.yml up -d
+#
+# Prerequisites:
+#   docker compose -f docker-compose.interop.yml build   (builds all custom images)
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+# ─── BitcoinPR common settings ────────────────────────────────────────────────
+x-bitcoinpr: &bitcoinpr
+  image: bitcoinpr-local:lite          # pick a stable tag
+  build:
+    context: .
+  # Run an init (tini) as PID 1 so SIGTERM from `docker stop`/`restart` is
+  # forwarded to bitcoinprd and the graceful shutdown (mempool save) runs.
+  init: true
+  restart: unless-stopped
+  mem_limit: 512m
+  logging: *default-logging
+  networks:
+    - interop
+
+# ─── BitcoinPR full-featured (indexing + web + mining) ────────────────────────
+x-bitcoinpr-full: &bitcoinpr-full
+  image: bitcoinpr-local:full
+  build:
+    context: .
+    args:
+      FEATURES: full
+  # Run an init (tini) as PID 1 so SIGTERM from `docker stop`/`restart` is
+  # forwarded to bitcoinprd and the graceful shutdown (mempool save) runs.
+  init: true
+  restart: unless-stopped
+  mem_limit: 1g
+  logging: *default-logging
+  networks:
+    - interop
+
+# ─── Bitcoin Core / Knots common settings ────────────────────────────────────
+x-core-like: &core-like
+  restart: unless-stopped
+  mem_limit: 512m
+  logging: *default-logging
+  networks:
+    - interop
+
+services:
+
+  # ── BitcoinPR #1 — seed node / miner / explorer ────────────────────────────
+  bitcoinpr1:
+    <<: *bitcoinpr-full
+    container_name: interop-bitcoinpr1
+    command: >
+      --network regtest
+      --datadir /data/bitcoinpr
+      --rpcbind 0.0.0.0
+      --rpcuser test
+      --rpcpassword test
+      --rpcport 18443
+      --port 18444
+      --loglevel debug
+      --index
+      --txindex
+      --mining
+      --miningport 3333
+      --miningaddress bcrt1qhgq7kd64luescw6d639vf3zj777m7600mwlc5f
+      --webport 3000
+      --miningdifficulty 70000
+      --gossip-private-addrs
+    ports:
+      - "18443:18443"   # RPC
+      - "18444:18444"   # P2P (needed so other containers can advertise their own connect)
+      - "3000:3000"     # Web block explorer
+      - "3333:3333"     # Stratum V1 / SV2 mining gateway
+      - "50001:50001"   # Electrum plain TCP
+      - "50002:50002"   # Electrum SSL/TLS
+    volumes:
+      - ${DATA_DIR:-./data/interop}/bitcoinpr1:/data/bitcoinpr
+    # Health check: the node's built-in /health endpoint on port 18543
+    # responds with "OK" when the RPC server is ready to accept connections.
+    # bash /dev/tcp is used because the image has no curl/wget.
+    healthcheck:
+      test: >
+        bash -c 'exec 3<>/dev/tcp/localhost/18543 &&
+          printf "GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3 &&
+          cat <&3 | grep -q "OK"'
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # ── BitcoinPR #2 — validator ────────────────────────────────────────────────
+  bitcoinpr2:
+    <<: *bitcoinpr
+    container_name: interop-bitcoinpr2
+    command: >
+      --network regtest
+      --datadir /data/bitcoinpr
+      --connect bitcoinpr1:18444
+      --rpcbind 0.0.0.0
+      --rpcuser test
+      --rpcpassword test
+      --rpcport 18443
+      --port 18444
+      --loglevel debug
+      --gossip-private-addrs
+    ports:
+      - "28443:18443"   # RPC
+    volumes:
+      - ${DATA_DIR:-./data/interop}/bitcoinpr2:/data/bitcoinpr
+    depends_on:
+      bitcoinpr1:
+        condition: service_healthy
+
+  # ── Bitcoin Core ───────────────────────────────────────────────────────────
+  bitcoin-core:
+    <<: *core-like
+    image: bitcoin/bitcoin:latest
+    container_name: interop-bitcoin-core
+    # The official image's entrypoint wraps bitcoind; CMD args are forwarded.
+    command:
+      - bitcoind
+      - -regtest
+      - -server=1
+      - -listen=1
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=test
+      - -rpcpassword=test
+      - -rpcport=18443
+      - -port=18444
+      - -addnode=bitcoinpr1:18444
+      - -dnsseed=0
+      - -fallbackfee=0.0001
+      - -debug=net
+      - -printtoconsole=1
+    ports:
+      - "38443:18443"   # RPC
+    # The official image runs as user bitcoin (uid 1000) with data at /home/bitcoin/.bitcoin
+    volumes:
+      - ${DATA_DIR:-./data/interop}/bitcoin-core:/home/bitcoin/.bitcoin
+    depends_on:
+      - bitcoinpr1
+
+  # ── Bitcoin Knots ──────────────────────────────────────────────────────────
+  bitcoin-knots:
+    <<: *core-like
+    build:
+      context: docker/bitcoin-knots
+    container_name: interop-bitcoin-knots
+    # Knots Dockerfile sets ENTRYPOINT ["bitcoind"] — do not repeat it in command.
+    command:
+      - -regtest
+      - -server=1
+      - -listen=1
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=test
+      - -rpcpassword=test
+      - -rpcport=18443
+      - -port=18444
+      - -addnode=bitcoinpr1:18444
+      - -dnsseed=0
+      - -fallbackfee=0.0001
+      - -debug=net
+      - -printtoconsole=1
+      - -datadir=/data
+    ports:
+      - "48443:18443"   # RPC
+    volumes:
+      - ${DATA_DIR:-./data/interop}/bitcoin-knots:/data
+    depends_on:
+      - bitcoinpr1
+
+  # ── btcd (Go) ──────────────────────────────────────────────────────────────
+  # btcd is a sync/validation node here: it connects to bitcoinpr1 over P2P and
+  # follows the regtest chain.  It has no built-in wallet (btcwallet is a
+  # separate daemon), so it is excluded from the active generate/relay RPC tests
+  # and only checked for tip agreement.
+  #   TLS stays ON: btcd refuses --notls when RPC binds to a non-localhost
+  #     address, so it keeps its auto-generated self-signed cert and the cluster
+  #     scripts query it over https with `curl -k` (skip cert verification).
+  #   --rpcuser/--rpcpass — mandatory, or btcd will not start its RPC server.
+  #   btcd regtest shares Core's network magic + genesis, so the chain validates.
+  btcd:
+    <<: *core-like
+    build:
+      context: docker/btcd
+    container_name: interop-btcd
+    # btcd Dockerfile sets ENTRYPOINT ["btcd"] — pass only flags in command.
+    command:
+      - --regtest
+      - --datadir=/data
+      - --addpeer=bitcoinpr1:18444
+      - --rpcuser=test
+      - --rpcpass=test
+      - --rpclisten=0.0.0.0:18443
+      - --listen=0.0.0.0:18444
+      - --debuglevel=info
+    ports:
+      - "58443:18443"   # RPC
+    volumes:
+      - ${DATA_DIR:-./data/interop}/btcd:/data
+    depends_on:
+      - bitcoinpr1
+
+  # ── Libbitcoin Server ──────────────────────────────────────────────────────
+  # NOTE: Libbitcoin uses a ZMQ-based query interface, NOT JSON-RPC.
+  # Block sync happens over standard Bitcoin P2P.  Use `bx` (bitcoin-explorer)
+  # to query the server, or watch its logs directly.
+  # Build time: 45–90 min (builds from source).  Pre-build with:
+  #   docker compose -f docker-compose.interop.yml build libbitcoin
+  libbitcoin:
+    <<: *core-like
+    # Override the 512m core-like cap: `bs --initchain` preallocates large
+    # bucket tables (~880MB+ for transaction_table alone) and gets OOM-killed
+    # under 512m, leaving a half-created chain/ dir the server can't open.
+    mem_limit: 4g
+    build:
+      context: docker/libbitcoin
+    container_name: interop-libbitcoin
+    volumes:
+      - ${DATA_DIR:-./data/interop}/libbitcoin:/data/libbitcoin
+      - ./docker/libbitcoin/bs.cfg:/etc/libbitcoin/bs.cfg:ro
+      - ./docker/libbitcoin/bx.cfg:/etc/libbitcoin/bx.cfg:ro
+    ports:
+      - "59091:9091"   # ZMQ public query
+      - "59092:9092"   # ZMQ public heartbeat
+      - "59093:9093"   # ZMQ public block publisher
+      - "59094:9094"   # ZMQ public transaction publisher
+    depends_on:
+      - bitcoinpr1
+
+networks:
+  interop:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

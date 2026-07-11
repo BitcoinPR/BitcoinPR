@@ -1,0 +1,61 @@
+# cargo-fuzz harness for BitcoinPR. Independent workspace (own `[workspace]`
+# table) so libfuzzer's panic=abort profile doesn't perturb the main build.
+#
+# Run with the nightly toolchain:
+#   cargo +nightly fuzz run fuzz_codec
+#   cargo +nightly fuzz build            # compile all targets
+[package]
+name = "bitcoinpr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tokio = { version = "1", features = ["rt"] }
+bitcoin = "0.32"
+bitcoinpr-core = { path = "../bitcoinpr-core" }
+bitcoinpr-p2p = { path = "../bitcoinpr-p2p" }
+bitcoinpr-storage = { path = "../bitcoinpr-storage" }
+bitcoinpr-index = { path = "../bitcoinpr-index" }
+
+[[bin]]
+name = "fuzz_codec"
+path = "fuzz_targets/fuzz_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_script"
+path = "fuzz_targets/fuzz_script.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_mempool"
+path = "fuzz_targets/fuzz_mempool.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_undo"
+path = "fuzz_targets/fuzz_undo.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_electrum"
+path = "fuzz_targets/fuzz_electrum.rs"
+test = false
+doc = false
+bench = false
+
+# Keep this crate out of the parent workspace.
+[workspace]

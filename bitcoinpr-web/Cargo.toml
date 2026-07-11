@@ -1,0 +1,24 @@
+[package]
+name = "bitcoinpr-web"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bitcoinpr-core = { path = "../bitcoinpr-core" }
+bitcoinpr-storage = { path = "../bitcoinpr-storage" }
+bitcoinpr-index = { path = "../bitcoinpr-index" }
+bitcoinpr-mining = { path = "../bitcoinpr-mining" }
+bitcoin.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+axum.workspace = true
+rust-embed.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+# Router-level tests drive the Axum app with tower::ServiceExt::oneshot.
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"

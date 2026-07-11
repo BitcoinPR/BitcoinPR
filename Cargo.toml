@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "bitcoinpr",
+    "bitcoinpr-core",
+    "bitcoinpr-p2p",
+    "bitcoinpr-rpc",
+    "bitcoinpr-storage",
+    "bitcoinpr-index",
+    "bitcoinpr-mining",
+    "bitcoinpr-web",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.110"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT"
+
+[workspace.dependencies]
+bitcoin = { version = "0.32", features = ["serde", "rand-std"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2"
+anyhow = "1"
+hex = "0.4"
+rayon = "1.10"
+rocksdb = "0.24"
+jsonrpsee = { version = "0.24", features = ["server", "macros"] }
+lru = "0.16"
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+rust-embed = { version = "8", features = ["axum"] }
+proptest = "1"
+num-bigint = "0.4"

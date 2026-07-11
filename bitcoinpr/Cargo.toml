@@ -1,0 +1,46 @@
+[package]
+name = "bitcoinpr"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "bitcoinprd"
+path = "src/main.rs"
+
+[features]
+default = []
+indexing = ["dep:bitcoinpr-index"]
+web = ["dep:bitcoinpr-web", "indexing"]
+full = ["web"]
+
+[dependencies]
+bitcoinpr-core = { path = "../bitcoinpr-core" }
+bitcoinpr-mining = { path = "../bitcoinpr-mining" }
+bitcoinpr-p2p = { path = "../bitcoinpr-p2p" }
+bitcoinpr-rpc = { path = "../bitcoinpr-rpc" }
+bitcoinpr-storage = { path = "../bitcoinpr-storage" }
+bitcoinpr-index = { path = "../bitcoinpr-index", optional = true }
+bitcoinpr-web = { path = "../bitcoinpr-web", optional = true }
+bitcoin.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+clap = { version = "4", features = ["derive"] }
+anyhow.workspace = true
+rand = "0.8"
+rayon.workspace = true
+libc = "0.2"
+
+# jemalloc as the global allocator: glibc malloc fragments the UTXO write
+# buffer's cyclic multi-GB alloc/free across per-thread arenas and never
+# returns freed pages to the OS — RSS ratcheted ~1.6GB per flush during IBD
+# until the kernel OOM-killed the node (2026-07-07). jemalloc's decay-based
+# purging returns memory and keeps RSS flat.
+#
+# `unprefixed_malloc_on_supported_platforms` is REQUIRED: without it jemalloc
+# only serves Rust allocations while RocksDB (C++) keeps calling glibc malloc
+# and its arenas ratchet all the same (verified: +1.9GB/flush-cycle with the
+# prefixed build). Unprefixed symbols make jemalloc the process-wide malloc.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
