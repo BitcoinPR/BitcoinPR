@@ -77,15 +77,40 @@ helpers, deliberately isolated so the pattern table is a one-module concern.
 
 ### Parasites: inscription envelopes (`tx_first_inscription_input`)
 
-An *inscription envelope* is the ordinals data-embedding pattern inside a
-taproot leaf script:
+Two envelope shapes are recognized.
+
+The classic *inscription envelope* is the ordinals data-embedding pattern
+inside a taproot leaf script:
 
 ```
 OP_FALSE OP_IF <push> <push> … OP_ENDIF
 ```
 
 The empty push makes the IF branch dead code, so arbitrary data rides the
-witness discount without ever executing. Detection:
+witness discount without ever executing. This shape is rejected at any size —
+it is unambiguous dead code.
+
+The *bare envelope* is the shape ordinals (ord#4545) adopted to stay valid
+under BIP-110, which disables `OP_IF`/`OP_NOTIF` in tapscript:
+
+```
+<marker> <data> <data> … OP_2DROP … OP_DROP
+```
+
+— a contiguous run of pushes balanced by drops, with no conditional at all.
+Detection mirrors Bitcoin Knots PR #319 (`DatacarrierBytes`): a contiguous
+run of pushes and pushnums (`OP_1NEGATE`, `OP_1`..`OP_16` — ord's parser
+accepts pushnums as payload, so an interleaved pushnum must not strand
+earlier pushes) terminated by `OP_DROP`/`OP_2DROP` is counted from the start
+of the run through the drop opcode. The input is rejected when the counted
+bytes exceed **`datacarriersize`** — so small, legitimate commit-and-drop
+tapscripts (e.g. a 32-byte commitment dropped before a key check, 34 counted
+bytes) stay standard under the default 83, while inscription content (chunked
+pushes, hundreds of bytes and up) is filtered. Scripts like
+`<locktime> OP_CHECKLOCKTIMEVERIFY OP_DROP` count nothing: the non-push
+opcode between the push and the drop breaks the run.
+
+Detection of the classic shape:
 
 1. **Recognize a script-path spend structurally.** The mempool has no prevouts
    at this point in `accept`, so taproot script-path is identified by witness
@@ -110,7 +135,7 @@ The token pattern table, in detection order:
 | **Runes** | OP_RETURN whose second byte is `OP_13` (`0x6a 0x5d` — the runestone magic) |
 | **Omni Layer** | first OP_RETURN data push begins with ASCII `omni` |
 | **Counterparty** | first OP_RETURN data push begins with ASCII `CNTRPRTY` |
-| **BRC-20** | inscription envelope whose concatenated payload contains `brc-20` (the JSON `"p":"brc-20"` protocol tag) |
+| **BRC-20** | envelope (classic OR bare) whose concatenated payload contains `brc-20` (the JSON `"p":"brc-20"` protocol tag) |
 
 BRC-20 detection is independent of `rejectparasites`: with parasites allowed
 but tokens rejected, a plain image inscription relays while a BRC-20 mint does

@@ -347,15 +347,73 @@ fn inscription_envelope_payload(script: &Script) -> Option<Vec<u8>> {
     None
 }
 
+/// Scan `script` for **bare envelopes**: contiguous runs of pushes/pushnums
+/// balanced by `OP_DROP`/`OP_2DROP` — the shape ordinals (ord#4545) adopts to
+/// stay valid under BIP-110, which disables `OP_IF` in tapscript (mirrors
+/// Bitcoin Knots PR #319). Returns `(counted, payload)`: `counted` is the
+/// total script bytes spanned by drop-terminated runs (run start through the
+/// drop opcode, Knots' `DatacarrierBytes` accounting) and `payload` is the
+/// concatenated push data from those runs, for token-marker scanning.
+///
+/// Pushnums (`OP_1NEGATE`, `OP_1`..`OP_16`) are run members: ord's parser
+/// accepts them as payload, so an interleaved pushnum must not strand earlier
+/// pushes from the count. Legitimate drop patterns are unaffected because the
+/// drop must directly follow the push run — `<locktime> OP_CLTV OP_DROP`
+/// breaks the run at the non-push opcode and counts nothing.
+fn bare_envelope_scan(script: &Script) -> (usize, Vec<u8>) {
+    let is_pushnum = |b: u8| b == 0x4f || (0x51..=0x60).contains(&b); // OP_1NEGATE, OP_1..OP_16
+    let mut counted = 0usize;
+    let mut payload = Vec::new();
+    let mut run_start = 0usize;
+    let mut run_data: Vec<u8> = Vec::new();
+    let mut prev_push = false;
+    for item in script.instruction_indices() {
+        let Ok((offset, inst)) = item else { break };
+        match inst {
+            Instruction::PushBytes(data) => {
+                if !prev_push {
+                    run_start = offset;
+                    run_data.clear();
+                }
+                run_data.extend_from_slice(data.as_bytes());
+                prev_push = true;
+            }
+            Instruction::Op(op) if is_pushnum(op.to_u8()) => {
+                if !prev_push {
+                    run_start = offset;
+                    run_data.clear();
+                }
+                prev_push = true;
+            }
+            Instruction::Op(op) => {
+                let b = op.to_u8();
+                if prev_push && (b == 0x75 || b == 0x6d) {
+                    // OP_DROP / OP_2DROP terminating a push run: count the
+                    // whole run through the drop opcode (1 byte).
+                    counted += offset + 1 - run_start;
+                    payload.extend_from_slice(&run_data);
+                }
+                prev_push = false;
+            }
+        }
+    }
+    (counted, payload)
+}
+
 /// Index of the first input whose tapscript carries an inscription envelope —
-/// Knots' parasite marker (`-rejectparasites`). `None` when the transaction is
-/// clean.
-pub fn tx_first_inscription_input(tx: &Transaction) -> Option<usize> {
+/// Knots' parasite marker (`-rejectparasites`). Two shapes are recognized:
+/// the classic `OP_FALSE OP_IF … OP_ENDIF` envelope (any size — it is
+/// unambiguous dead code), and the BIP-110-era bare envelope (drop-balanced
+/// push runs) when the counted bytes exceed `bare_threshold` — sized so that
+/// legitimate small commit-and-drop tapscripts (e.g. a 32-byte commitment
+/// dropped before a key check) stay standard. Callers pass the configured
+/// `datacarriersize` as the threshold. `None` when the transaction is clean.
+pub fn tx_first_inscription_input(tx: &Transaction, bare_threshold: usize) -> Option<usize> {
     tx.input.iter().position(|input| {
-        taproot_leaf_script(&input.witness)
-            .map(Script::from_bytes)
-            .and_then(inscription_envelope_payload)
-            .is_some()
+        let Some(leaf) = taproot_leaf_script(&input.witness).map(Script::from_bytes) else {
+            return false;
+        };
+        inscription_envelope_payload(leaf).is_some() || bare_envelope_scan(leaf).0 > bare_threshold
     })
 }
 
@@ -400,13 +458,15 @@ pub fn tx_token_protocol(tx: &Transaction) -> Option<&'static str> {
         }
     }
     for input in &tx.input {
-        if let Some(payload) = taproot_leaf_script(&input.witness)
-            .map(Script::from_bytes)
-            .and_then(inscription_envelope_payload)
-        {
-            if payload.windows(6).any(|w| w == b"brc-20") {
-                return Some("brc-20");
-            }
+        let Some(leaf) = taproot_leaf_script(&input.witness).map(Script::from_bytes) else {
+            continue;
+        };
+        // Token payloads may ride either envelope shape: the classic OP_IF
+        // envelope or a BIP-110-era bare (drop-balanced) envelope.
+        let mut payload = inscription_envelope_payload(leaf).unwrap_or_default();
+        payload.extend_from_slice(&bare_envelope_scan(leaf).1);
+        if payload.windows(6).any(|w| w == b"brc-20") {
+            return Some("brc-20");
         }
     }
     None
@@ -3513,24 +3573,24 @@ mod tests {
     fn test_inscription_envelope_detection() {
         // Inscription envelope in a tapscript leaf: detected on input 0.
         let tx = tx_with_witness(inscription_witness(b"hello inscription"));
-        assert_eq!(tx_first_inscription_input(&tx), Some(0));
+        assert_eq!(tx_first_inscription_input(&tx, 83), Some(0));
 
         // Same witness plus a BIP 341 annex: still detected.
         let mut w = inscription_witness(b"with annex");
         w.push([0x50, 0xaa]);
-        assert_eq!(tx_first_inscription_input(&tx_with_witness(w)), Some(0));
+        assert_eq!(tx_first_inscription_input(&tx_with_witness(w), 83), Some(0));
 
         // P2WPKH-shaped witness (sig + 33-byte pubkey): the pubkey is not a
         // control block (wrong leading byte), so no false positive.
         let mut w = bitcoin::Witness::new();
         w.push([0u8; 72]);
         w.push([0x02; 33]);
-        assert_eq!(tx_first_inscription_input(&tx_with_witness(w)), None);
+        assert_eq!(tx_first_inscription_input(&tx_with_witness(w), 83), None);
 
         // Taproot key-path spend (single signature element): clean.
         let mut w = bitcoin::Witness::new();
         w.push([0u8; 64]);
-        assert_eq!(tx_first_inscription_input(&tx_with_witness(w)), None);
+        assert_eq!(tx_first_inscription_input(&tx_with_witness(w), 83), None);
 
         // Taproot script-path WITHOUT an envelope (plain OP_TRUE leaf): clean.
         let mut w = bitcoin::Witness::new();
@@ -3538,7 +3598,115 @@ mod tests {
         let mut control = vec![0xc0];
         control.extend_from_slice(&[0x02; 32]);
         w.push(&control);
-        assert_eq!(tx_first_inscription_input(&tx_with_witness(w)), None);
+        assert_eq!(tx_first_inscription_input(&tx_with_witness(w), 83), None);
+    }
+
+    /// Taproot script-path witness with an arbitrary leaf script (shape-valid
+    /// 33-byte control block), for bare-envelope tests.
+    fn tapscript_witness(leaf: &[u8]) -> bitcoin::Witness {
+        let mut control = vec![0xc0];
+        control.extend_from_slice(&[0x02; 32]);
+        let mut w = bitcoin::Witness::new();
+        w.push([0u8; 64]);
+        w.push(leaf);
+        w.push(&control);
+        w
+    }
+
+    /// Bare-envelope leaf (the ord#4545 BIP-110 workaround shape):
+    /// `"ord" <body chunks> OP_2DROP… OP_DROP OP_TRUE` — pushes balanced by
+    /// drops, no OP_IF. Mirrors the functional test in Knots PR #319.
+    fn bare_envelope_leaf(body: &[u8]) -> Vec<u8> {
+        let mut leaf = vec![0x03];
+        leaf.extend_from_slice(b"ord");
+        let chunks: Vec<&[u8]> = body.chunks(75).collect();
+        for chunk in &chunks {
+            leaf.push(chunk.len() as u8);
+            leaf.extend_from_slice(chunk);
+        }
+        // Balance the stack: "ord" + chunks = chunks.len()+1 items.
+        let mut remaining = chunks.len() + 1;
+        while remaining >= 2 {
+            leaf.push(0x6d); // OP_2DROP
+            remaining -= 2;
+        }
+        if remaining == 1 {
+            leaf.push(0x75); // OP_DROP
+        }
+        leaf.push(0x51); // OP_TRUE
+        leaf
+    }
+
+    #[test]
+    fn test_bare_envelope_detection() {
+        // Large bare envelope (well over the 83-byte threshold): parasite.
+        let tx = tx_with_witness(tapscript_witness(&bare_envelope_leaf(&[0xab; 200])));
+        assert_eq!(tx_first_inscription_input(&tx, 83), Some(0));
+
+        // Pushnum interleaved in the run (ord's parser accepts pushnums as
+        // payload) must not strand the large push from the count:
+        // <200 bytes> OP_7 <2 bytes> OP_2DROP OP_DROP OP_TRUE.
+        let mut leaf = vec![0x4c, 200]; // OP_PUSHDATA1 200
+        leaf.extend_from_slice(&[0xab; 200]);
+        leaf.push(0x57); // OP_7 (pushnum)
+        leaf.extend_from_slice(&[0x02, 0xcd, 0xcd]); // 2-byte push
+        leaf.extend_from_slice(&[0x6d, 0x75, 0x51]); // OP_2DROP OP_DROP OP_TRUE
+        let tx = tx_with_witness(tapscript_witness(&leaf));
+        assert_eq!(tx_first_inscription_input(&tx, 83), Some(0));
+
+        // Small commit-and-drop tapscript (32-byte commitment dropped before
+        // a key check) stays under the threshold: standard.
+        let mut leaf = vec![0x20]; // PUSH32
+        leaf.extend_from_slice(&[0xee; 32]);
+        leaf.push(0x75); // OP_DROP
+        leaf.push(0x20); // PUSH32 (x-only pubkey)
+        leaf.extend_from_slice(&[0x03; 32]);
+        leaf.push(0xac); // OP_CHECKSIG
+        let tx = tx_with_witness(tapscript_witness(&leaf));
+        assert_eq!(tx_first_inscription_input(&tx, 83), None);
+
+        // CLTV-style drop: the non-push opcode between the push and the drop
+        // breaks the run, so a large push is NOT counted as envelope data.
+        let mut leaf = vec![0x4c, 200];
+        leaf.extend_from_slice(&[0xab; 200]);
+        leaf.push(0xb1); // OP_CHECKLOCKTIMEVERIFY
+        leaf.push(0x75); // OP_DROP
+        leaf.push(0x51); // OP_TRUE
+        let tx = tx_with_witness(tapscript_witness(&leaf));
+        assert_eq!(tx_first_inscription_input(&tx, 83), None);
+
+        // A large push run with NO terminating drop is not an envelope.
+        let mut leaf = vec![0x4c, 200];
+        leaf.extend_from_slice(&[0xab; 200]);
+        leaf.push(0x51); // OP_TRUE
+        let tx = tx_with_witness(tapscript_witness(&leaf));
+        assert_eq!(tx_first_inscription_input(&tx, 83), None);
+
+        // Byte accounting mirrors Knots' DatacarrierBytes unit tests:
+        // <11 zeros> <11 zeros> OP_2DROP = 12 + 12 + 1 = 25 counted bytes;
+        // <11 zeros> OP_7 <11 zeros> OP_2DROP = 12 + 1 + 12 + 1 = 26.
+        let mut leaf = vec![0x0b];
+        leaf.extend_from_slice(&[0x00; 11]);
+        leaf.push(0x0b);
+        leaf.extend_from_slice(&[0x00; 11]);
+        leaf.push(0x6d);
+        assert_eq!(bare_envelope_scan(Script::from_bytes(&leaf)).0, 25);
+        let mut leaf = vec![0x0b];
+        leaf.extend_from_slice(&[0x00; 11]);
+        leaf.push(0x57); // OP_7
+        leaf.push(0x0b);
+        leaf.extend_from_slice(&[0x00; 11]);
+        leaf.push(0x6d);
+        assert_eq!(bare_envelope_scan(Script::from_bytes(&leaf)).0, 26);
+    }
+
+    #[test]
+    fn test_bare_envelope_token_detection() {
+        // BRC-20 payload inside a bare (OP_IF-free) envelope: still a token.
+        let tx = tx_with_witness(tapscript_witness(&bare_envelope_leaf(
+            br#"{"p":"brc-20","op":"mint","tick":"x"}"#,
+        )));
+        assert_eq!(tx_token_protocol(&tx), Some("brc-20"));
     }
 
     #[test]
