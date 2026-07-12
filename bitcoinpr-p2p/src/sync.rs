@@ -356,7 +356,24 @@ impl HeaderSync {
             {
                 prev_stored.chain_work
             } else {
-                [0u8; 32]
+                // Never fall back to zero prev work. Storing this header with
+                // a from-zero cumulative work poisons every descendant: the
+                // tip's chain work collapses below nMinimumChainWork, which
+                // permanently wedges header sync and block download (observed
+                // on mainnet after a crash left a header's data missing while
+                // its hash stayed known). Treat it like an unconnected header
+                // so the caller re-anchors getheaders at our tip and the gap
+                // gets refetched with full data.
+                warn!(
+                    height,
+                    hash = %hash,
+                    prev = %header.prev_blockhash,
+                    "Prev header data missing — cannot compute chain work, requesting gap fill"
+                );
+                return Err(HeaderSyncError::Unconnected(format!(
+                    "prev header {} of height {} has no stored data",
+                    header.prev_blockhash, height
+                )));
             };
             let chain_work = bitcoinpr_core::add_chain_work(&prev_work, &block_work);
 
@@ -1173,6 +1190,33 @@ mod header_sync_tests {
         sync.process_headers(&[h1], 0).unwrap();
         assert!(sync.has_min_chain_work());
         assert!(sync.synced);
+    }
+
+    /// A header that connects to our tip hash while the tip's header *data*
+    /// is missing from the index (crash artifact) must fail as Unconnected —
+    /// the old code silently computed its cumulative chain work from zero,
+    /// poisoning every descendant and collapsing the tip's work below
+    /// nMinimumChainWork (observed wedging mainnet sync at height 957639).
+    #[test]
+    fn missing_prev_header_data_errors_instead_of_zero_work() {
+        let params = retargeting_params();
+        let (_dir, index) = open_index();
+        let mut sync = sync_at_genesis(&params, &index);
+        let genesis = params.genesis_block.header;
+
+        // Tip is h1, but h1's header data was never durably written.
+        let h1 = mine_header(genesis.block_hash(), genesis.bits, genesis.time + 600);
+        sync.best_height = 1;
+        sync.best_hash = h1.block_hash();
+
+        let h2 = mine_header(h1.block_hash(), genesis.bits, genesis.time + 1200);
+        let err = sync.process_headers(&[h2], 0).unwrap_err();
+        assert!(
+            matches!(err, HeaderSyncError::Unconnected(_)),
+            "expected Unconnected, got {err:?}"
+        );
+        // The header must not have been stored with bogus chain work.
+        assert!(index.get_header(&h2.block_hash()).unwrap().is_none());
     }
 
     /// `download_paused` must gate every assignment path (normal + emergency);

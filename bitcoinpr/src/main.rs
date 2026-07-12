@@ -979,8 +979,12 @@ async fn main() -> anyhow::Result<()> {
         header_tip_hash,
     );
 
-    // Create block sync
-    let block_sync = BlockSync::new();
+    // Create block sync. Start with downloads paused if the header chain is
+    // still below the network's minimum chain work (fresh IBD) — the event
+    // loop's gate is open-only (monotonic), so the initial state must be set
+    // here.
+    let mut block_sync = BlockSync::new();
+    block_sync.download_paused = !header_sync.has_min_chain_work();
 
     // --- Scripthash Index (optional, requires "indexing" feature) ---
     #[cfg(feature = "indexing")]

@@ -32,6 +32,18 @@ fn hash_from_bytes(data: &[u8]) -> StorageResult<BlockHash> {
     BlockHash::from_slice(data).map_err(|e| StorageError::Serialization(e.to_string()))
 }
 
+/// Add two 256-bit big-endian integers (cumulative chain work).
+fn add_work(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let mut result = [0u8; 32];
+    let mut carry = 0u16;
+    for i in (0..32).rev() {
+        let sum = a[i] as u16 + b[i] as u16 + carry;
+        result[i] = sum as u8;
+        carry = sum >> 8;
+    }
+    result
+}
+
 /// Stored header entry containing the header, its height, and cumulative chain work.
 #[derive(Debug, Clone)]
 pub struct StoredHeader {
@@ -402,12 +414,21 @@ impl HeaderIndex {
         const CHECK_DEPTH: u32 = 1_000;
         let start_height = best_height.saturating_sub(CHECK_DEPTH);
 
-        // Seed prev_hash from the block before our scan window
+        // Seed prev_hash (and its cumulative chain work) from the block
+        // before our scan window. Like the linkage check, this trusts the
+        // deep history — corruption there would have been caught earlier.
         let mut prev_hash = if start_height > 0 {
             self.get_hash_at_height(start_height.saturating_sub(1))?
         } else {
             None
         };
+        let mut prev_work: Option<[u8; 32]> = match prev_hash {
+            Some(h) => self.get_header(&h)?.map(|s| s.chain_work),
+            None => None,
+        };
+        // Headers whose stored cumulative chain work mismatches the
+        // recomputed value — rewritten in one batch before returning.
+        let mut work_repairs: Vec<(BlockHash, StoredHeader)> = Vec::new();
         let mut checked = if start_height > 0 {
             start_height - 1
         } else {
@@ -432,6 +453,7 @@ impl HeaderIndex {
                         "Header chain gap: height→hash index entry missing — truncating to height {} (forward recovery will follow)",
                         height.saturating_sub(1)
                     );
+                    self.apply_work_repairs(&work_repairs)?;
                     return Ok((height.saturating_sub(1), best_height));
                 }
             };
@@ -446,6 +468,7 @@ impl HeaderIndex {
                         "Header chain gap: header data missing for known hash — truncating to height {}",
                         height.saturating_sub(1)
                     );
+                    self.apply_work_repairs(&work_repairs)?;
                     return Ok((height.saturating_sub(1), best_height));
                 }
             };
@@ -458,6 +481,7 @@ impl HeaderIndex {
                     "Header chain gap: stored height mismatches index height — truncating to height {}",
                     height.saturating_sub(1)
                 );
+                self.apply_work_repairs(&work_repairs)?;
                 return Ok((height.saturating_sub(1), best_height));
             }
 
@@ -470,15 +494,99 @@ impl HeaderIndex {
                         "Chain break — truncating to height {}",
                         height - 1
                     );
+                    self.apply_work_repairs(&work_repairs)?;
                     return Ok((height - 1, best_height));
                 }
+            }
+
+            // Verify cumulative chain work. A crash can leave a header's data
+            // missing while descendants (stored with their own chain work)
+            // survive; if those descendants were ever recomputed against a
+            // missing parent, their stored work restarts from ~zero. Stale
+            // low-work entries silently poison every later header built on
+            // them: the tip's cumulative work falls below nMinimumChainWork
+            // and header sync / block download wedge permanently. Recompute
+            // from the previous header's (possibly repaired) work and rewrite
+            // any mismatch.
+            match prev_work {
+                Some(pw) => {
+                    let block_work = stored.header.target().to_work().to_be_bytes();
+                    let expected = add_work(&pw, &block_work);
+                    if stored.chain_work != expected {
+                        let mut fixed = stored.clone();
+                        fixed.chain_work = expected;
+                        work_repairs.push((hash, fixed));
+                    }
+                    prev_work = Some(expected);
+                }
+                // No trusted baseline (seed header missing, or window starts
+                // at genesis): adopt the first stored value and verify the
+                // rest of the window relative to it.
+                None => prev_work = Some(stored.chain_work),
             }
 
             prev_hash = Some(hash);
             checked = height;
         }
 
+        // Headers-first sync stores headers *beyond* the validated tip, and
+        // HeaderSync seeds its cumulative work from the HEADER tip — so
+        // corrupt chain work up there re-wedges sync even when everything at
+        // or below the validated tip is clean (observed on mainnet: a wedged
+        // run kept accepting headers above its stuck validated tip, all built
+        // on poisoned work). Extend the chain-work verification to the header
+        // tip. Structural problems here just end the scan — headers above the
+        // validated tip are healed by normal header re-sync, not truncation.
+        let header_tip_height = self.get_header_tip_height()?.unwrap_or(best_height);
+        for height in (best_height + 1)..=header_tip_height {
+            let Some(hash) = self.get_hash_at_height(height)? else {
+                break;
+            };
+            let Some(stored) = self.get_header(&hash)? else {
+                break;
+            };
+            if stored.height != height {
+                break;
+            }
+            if let Some(expected_prev) = prev_hash {
+                if stored.header.prev_blockhash != expected_prev {
+                    break;
+                }
+            }
+            match prev_work {
+                Some(pw) => {
+                    let block_work = stored.header.target().to_work().to_be_bytes();
+                    let expected = add_work(&pw, &block_work);
+                    if stored.chain_work != expected {
+                        let mut fixed = stored.clone();
+                        fixed.chain_work = expected;
+                        work_repairs.push((hash, fixed));
+                    }
+                    prev_work = Some(expected);
+                }
+                None => prev_work = Some(stored.chain_work),
+            }
+            prev_hash = Some(hash);
+        }
+
+        self.apply_work_repairs(&work_repairs)?;
         Ok((checked, best_height))
+    }
+
+    /// Rewrite headers whose stored cumulative chain work was found
+    /// inconsistent by `verify_chain_integrity`. Hash→header data only —
+    /// the height→hash index for these heights was already verified.
+    fn apply_work_repairs(&self, repairs: &[(BlockHash, StoredHeader)]) -> StorageResult<()> {
+        if repairs.is_empty() {
+            return Ok(());
+        }
+        warn!(
+            count = repairs.len(),
+            first_height = repairs.first().map(|(_, s)| s.height),
+            last_height = repairs.last().map(|(_, s)| s.height),
+            "Repairing headers with inconsistent cumulative chain work"
+        );
+        self.insert_headers_hash_only(repairs)
     }
 
     /// Truncate the header chain: reset the best tip to `keep_height` and
@@ -739,5 +847,75 @@ mod tests {
 
         index.insert_headers_batch(&entries).unwrap();
         assert!(index.get_header(&hash).unwrap().is_some());
+    }
+
+    /// Headers stored with corrupt (from-zero) cumulative chain work must be
+    /// repaired by the startup integrity scan. Crash artifact: a header's
+    /// data goes missing while its descendants survive with chain work that
+    /// restarted from zero — every later header builds on the poisoned value
+    /// and the tip falls below nMinimumChainWork, wedging sync permanently.
+    #[test]
+    fn verify_chain_integrity_repairs_corrupt_chain_work() {
+        use bitcoin::hashes::Hash as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let index = HeaderIndex::open(dir.path()).unwrap();
+
+        let mk = |prev: BlockHash, nonce: u32| bitcoin::block::Header {
+            version: bitcoin::block::Version::from_consensus(4),
+            prev_blockhash: prev,
+            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+            time: 1_700_000_000 + nonce,
+            bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+            nonce,
+        };
+
+        let h0 = mk(BlockHash::all_zeros(), 0);
+        let h1 = mk(h0.block_hash(), 1);
+        let h2 = mk(h1.block_hash(), 2);
+        let h3 = mk(h2.block_hash(), 3);
+
+        let work = |h: &bitcoin::block::Header| h.target().to_work().to_be_bytes();
+        let w1 = work(&h1); // genesis convention: h0 contributes zero
+        let w2 = add_work(&w1, &work(&h2));
+        let w3 = add_work(&w2, &work(&h3));
+
+        // h2 and h3 stored with from-zero cumulative work (corrupt).
+        for (header, height, cw) in [
+            (h0, 0u32, [0u8; 32]),
+            (h1, 1, w1),
+            (h2, 2, work(&h2)),
+            (h3, 3, work(&h3)),
+        ] {
+            index
+                .insert_header(
+                    &header.block_hash(),
+                    &StoredHeader {
+                        header,
+                        height,
+                        chain_work: cw,
+                    },
+                )
+                .unwrap();
+        }
+        // h3 is a header BEYOND the validated tip (headers-first sync) — the
+        // repair must reach it, since HeaderSync seeds its cumulative work
+        // from the header tip.
+        index.set_best_tip(&h2.block_hash(), 2).unwrap();
+        index.set_header_tip(&h3.block_hash(), 3).unwrap();
+
+        let (verified, best) = index.verify_chain_integrity().unwrap();
+        assert_eq!((verified, best), (2, 2));
+
+        let cw_at = |h: &bitcoin::block::Header| {
+            index
+                .get_header(&h.block_hash())
+                .unwrap()
+                .unwrap()
+                .chain_work
+        };
+        assert_eq!(cw_at(&h2), w2, "corrupt chain work must be repaired");
+        assert_eq!(cw_at(&h3), w3, "repair must cascade to descendants");
+        assert_eq!(cw_at(&h1), w1, "correct entries must be untouched");
     }
 }

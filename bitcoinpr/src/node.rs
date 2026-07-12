@@ -1056,16 +1056,19 @@ impl Node {
             // Defer block download until the best header chain has the
             // network's minimum chain work (Bitcoin Core's nMinimumChainWork):
             // headers then sync on quiet connections in minutes instead of
-            // competing with ~50MB block batches. Monotonic — work only grows,
-            // so once the gate opens it stays open.
-            let downloads_allowed = header_sync.has_min_chain_work();
-            if block_sync.download_paused && downloads_allowed {
+            // competing with ~50MB block batches. Monotonic — the gate only
+            // ever opens here (initial state is set at startup). Re-pausing
+            // on a work drop wedged the node once: a header stored with
+            // corrupt (near-zero) cumulative work collapsed best_chain_work
+            // mid-run, silently re-closed the gate, and block download froze
+            // at the tip with a full queue.
+            if block_sync.download_paused && header_sync.has_min_chain_work() {
                 info!(
                     height = header_sync.best_height,
                     "Minimum chain work reached — starting block download"
                 );
+                block_sync.download_paused = false;
             }
-            block_sync.download_paused = !downloads_allowed;
 
             tokio::select! {
                 biased;
