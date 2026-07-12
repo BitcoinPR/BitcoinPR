@@ -76,6 +76,32 @@
         }
     }
 
+    /* ---- Global chrome (nav tabs, footer) ---- */
+
+    /* Elements outside the routed page that depend on node stats: the
+       Mining / Mining Config tabs (hidden when the node has no mining
+       configuration) and the footer version. Must be applied on every
+       full page load — not just the dashboard route — or a refresh on
+       #/info or #/mempool leaves the mining tabs visible until the
+       user happens to visit the dashboard. */
+    function applyGlobalStats(stats) {
+        const version = document.getElementById('footer-version');
+        if (version && stats.node_version) {
+            version.textContent = stats.node_version;
+        }
+        document.querySelectorAll('[data-route="/mining"], [data-route="/mining/config"]').forEach(function (el) {
+            el.style.display = stats.mining_enabled ? '' : 'none';
+        });
+    }
+
+    async function initGlobalStats() {
+        try {
+            applyGlobalStats(await api('stats'));
+        } catch (err) {
+            // Stats unavailable: leave the default chrome untouched.
+        }
+    }
+
     /* ---- API Helpers ---- */
 
     async function api(path) {
@@ -374,14 +400,7 @@
         try {
             const stats = await api('stats');
 
-            if (document.getElementById('footer-version') && stats.node_version) {
-                document.getElementById('footer-version').textContent = stats.node_version;
-            }
-
-            // Hide mining tabs if mining is not enabled
-            document.querySelectorAll('[data-route="/mining"], [data-route="/mining/config"]').forEach(function (el) {
-                el.style.display = stats.mining_enabled ? '' : 'none';
-            });
+            applyGlobalStats(stats);
 
             let html = `
                 <div class="page-header">
@@ -2636,6 +2655,7 @@
         }
 
         router();
+        initGlobalStats();
         initWebSocket();
     }
 

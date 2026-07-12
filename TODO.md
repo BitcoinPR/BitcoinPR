@@ -18,6 +18,25 @@ Completed work lives in [CHANGELOG.md](CHANGELOG.md).
   Before merging: rebase if needed and run the interop suite via the
   recreate-only-bitcoinpr procedure.
 
+### Follow-ups (added 2026-07-12)
+
+- [ ] **Scripthash resolver: byte offset in `TxIndexEntry`** — the structural
+  follow-up to the 2026-07-12 backfill efficiency rework (see CHANGELOG):
+  storing `(offset, len)` alongside `(block_hash, tx_pos)` would make each
+  cache-missed prevout a single small read + one tx decode instead of a
+  partial block scan. Needs a v2 entry format and a tx-index reindex (or
+  write-new/read-both migration).
+
+- [ ] **Block-download stall detectors misfire at tip** — the head-of-line
+  escalation (node.rs "Head-of-line block stalled"), stale per-peer request
+  clearing ("Cleared stale per-peer block requests"), and pipeline-stall
+  recovery ("Pipeline stall") all key off the global `last_block_connect`
+  timer, which is meaningless once synced: a natural 10–20 min gap between
+  blocks trips them and triggers redundant emergency getdata to multiple
+  peers. Fix: give `BlockSync::in_flight` (p2p/sync.rs) per-request
+  timestamps and escalate/clear only requests that are actually old, keeping
+  the warns meaningful during IBD.
+
 ### SV2 / Datum Mining Gateway
 
 The Datum runtime-config, Datum client, and Datum web UI are complete (see the

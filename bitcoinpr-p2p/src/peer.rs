@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::codec::MessageCodec;
 use crate::error::{P2pError, P2pResult};
@@ -542,7 +542,9 @@ where
         }
         while let Some(msg) = msg_rx.recv().await {
             if let Err(e) = send_tr.send(&mut writer, &msg).await {
-                warn!(peer_id = id, "Write error: {e}");
+                // Routine peer hang-up (broken pipe mid-write); the
+                // Disconnected event below drives all cleanup.
+                debug!(peer_id = id, "Write error: {e}");
                 let _ = write_event_tx
                     .send(PeerEvent::Disconnected(id, format!("write error: {e}")))
                     .await;

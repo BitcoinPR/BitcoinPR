@@ -63,7 +63,13 @@ else
 fi
 
 # ---------- helpers ----------
-hr() { printf '%s\n' "$C_DIM ₿· · · · · · · · · · · · · · · · · · · · · · · · ₿ · · · · · · · · · · · · · · · · · · · · · · · ·₿$C_RESET"; }
+# Symmetric 97-col rule: ₿ anchors at both ends and the centre, dot fill.
+HR_LINE="₿ · · · · · · · · · · · · · · · · · · · · · · · ₿ · · · · · · · · · · · · · · · · · · · · · · · ₿"
+hr() { printf '%s\n' "$C_DIM$HR_LINE$C_RESET"; }
+
+# RPC endpoint with any user:pass@ credentials stripped — never print the
+# raw URL, it usually embeds the RPC password.
+sanitize_url() { printf '%s' "$1" | sed -E 's#(https?://)[^@/[:space:]]+@#\1#'; }
 
 # Repeat a character N times.
 rep() { local c="$1" n="$2" out=""; while [ "$n" -gt 0 ]; do out="$out$c"; n=$((n-1)); done; printf '%s' "$out"; }
@@ -78,7 +84,13 @@ bar() {
   printf '%s%s%s%s%s' "$C_ACCENT" "$(rep '█' "$fill")" "$C_DIM" "$(rep '░' "$empty")" "$C_RESET"
 }
 
+RPC_URL_DISPLAY=$(sanitize_url "$RPC_URL")
+
 # ---------- workspace metrics (from filesystem) ----------
+# Workspace version — crates inherit it from [workspace.package] in the
+# root Cargo.toml (single source of truth).
+NODE_VERSION=$(sed -nE 's/^version *= *"([^"]+)".*/\1/p' Cargo.toml 2>/dev/null | head -n1)
+NODE_VERSION="${NODE_VERSION:-unknown}"
 crate_loc() {
   local crate="$1"
   find "$crate/src" -name '*.rs' -type f -exec cat {} + 2>/dev/null | wc -l | tr -d ' '
@@ -258,10 +270,10 @@ UPTIME_HUMAN=$(human_uptime "$UPTIME_S")
 
 # ---------- readiness scoring (heuristic) ----------
 # L1 = consensus + storage parity; L2 = networking + indexing; L3 = mining decentralisation.
-# Pull the rough %s from TODO.md headers + crate weights.
-L1_PCT=88   # consensus + storage parity; BIP-110 RDTS + assume-valid + reorgs done
-L2_PCT=70   # P2P + indexing done; Tor/I2P pending
-L3_PCT=45   # Datum client + runtime mining config done; SV2 Noise handshake pending
+# Hand-scored from TODO.md / CHANGELOG.md — update when either changes (last: 2026-07-12).
+L1_PCT=90   # consensus + storage parity; BIP-110 RDTS, assume-valid, pruning, chain-work repair done
+L2_PCT=85   # P2P + indexing + Tor/I2P done; wire differential harness + Electrum conformance pending
+L3_PCT=50   # Datum client + runtime mining config done; SV2 Noise handshake pending
 
 # ---------- BIP coverage map ----------
 # Group BIPs into rough categories for the grid.
@@ -312,7 +324,7 @@ render() {
   clear_screen
 
   hr
-  printf "            ${C_BOLD}${C_ACCENT}BITCOINPR${C_RESET}  ${C_DIM}■${C_RESET}  ${C_FG}Pure Rust Bitcoin full node 0.1.110${C_RESET}  ${C_DIM}■${C_RESET}  ${C_FG}RocksDB + tokio${C_RESET}\n"
+  printf "            ${C_BOLD}${C_ACCENT}BITCOINPR${C_RESET}  ${C_DIM}■${C_RESET}  ${C_FG}Pure Rust Bitcoin full node ${NODE_VERSION}${C_RESET}  ${C_DIM}■${C_RESET}  ${C_FG}RocksDB + tokio${C_RESET}\n"
   hr
 
   # ----- HARNESS / ABOUT -----
@@ -329,15 +341,13 @@ render() {
   printf "\n"
   printf "${C_BOLD}${C_ACCENT}"
   cat <<'TITLE'
-  
-░████████   ░██████░██████████  ░██████    ░██████   ░██████░███    ░██ ░█████████  ░█████████  
-░██    ░██    ░██      ░██     ░██   ░██  ░██   ░██    ░██  ░████   ░██ ░██     ░██ ░██     ░██ 
-░██    ░██    ░██      ░██    ░██        ░██     ░██   ░██  ░██░██  ░██ ░██     ░██ ░██     ░██ 
-░████████     ░██      ░██    ░██        ░██     ░██   ░██  ░██ ░██ ░██ ░█████████  ░█████████  
-░██     ░██   ░██      ░██    ░██        ░██     ░██   ░██  ░██  ░██░██ ░██         ░██   ░██   
-░██     ░██   ░██      ░██     ░██   ░██  ░██   ░██    ░██  ░██   ░████ ░██         ░██    ░██  
-░█████████  ░██████    ░██      ░██████    ░██████   ░██████░██    ░███ ░██         ░██     ░██ 
-                                                                                                
+░████████   ░██████░██████████  ░██████    ░██████   ░██████░███    ░██ ░█████████  ░█████████
+░██    ░██    ░██      ░██     ░██   ░██  ░██   ░██    ░██  ░████   ░██ ░██     ░██ ░██     ░██
+░██    ░██    ░██      ░██    ░██        ░██     ░██   ░██  ░██░██  ░██ ░██     ░██ ░██     ░██
+░████████     ░██      ░██    ░██        ░██     ░██   ░██  ░██ ░██ ░██ ░█████████  ░█████████
+░██     ░██   ░██      ░██    ░██        ░██     ░██   ░██  ░██  ░██░██ ░██         ░██   ░██
+░██     ░██   ░██      ░██     ░██   ░██  ░██   ░██    ░██  ░██   ░████ ░██         ░██    ░██
+░█████████  ░██████    ░██      ░██████    ░██████   ░██████░██    ░███ ░██         ░██     ░██
 TITLE
   printf "${C_RESET}"
   printf "\n"
@@ -377,7 +387,7 @@ TITLE
   # ----- LIVE STATUS -----
   printf "\n"
   if [ "$RPC_OK" = 1 ]; then
-    printf "  ${C_BOLD}STATUS${C_RESET}     ${C_GREEN}live binary${C_RESET}  $NET_NAME  ${C_DIM}■${C_RESET}  uptime $UPTIME_HUMAN  ${C_DIM}■${C_RESET}  rpc $RPC_URL\n"
+    printf "  ${C_BOLD}STATUS${C_RESET}     ${C_GREEN}live binary${C_RESET}  $NET_NAME  ${C_DIM}■${C_RESET}  uptime $UPTIME_HUMAN  ${C_DIM}■${C_RESET}  rpc $RPC_URL_DISPLAY\n"
     printf "             tip          h=%s / headers=%s   IBD=%s   diff=%s\n" \
       "$SYNC_HEIGHT" "$SYNC_HEADERS" "$IBD" "$DIFFICULTY"
     if [ "$BLOCKSDIR_SIZE" != "-" ]; then
@@ -391,14 +401,17 @@ TITLE
     pct_int=$(printf "%.0f" "$PROGRESS_PCT" 2>/dev/null || echo 0)
     printf "             sync         %s  %s%%\n" "$(bar "$pct_int" 100 40)" "$PROGRESS_PCT"
   else
-    printf "  ${C_BOLD}STATUS${C_RESET}     ${C_DIM}no live node detected at${C_RESET} $RPC_URL\n"
+    printf "  ${C_BOLD}STATUS${C_RESET}     ${C_DIM}no live node detected at${C_RESET} $RPC_URL_DISPLAY\n"
     printf "             start one with:  ${C_BLUE}cargo run --release -- --network signet${C_RESET}\n"
     printf "             or pass:         ${C_BLUE}--rpc http://user:pass@host:port${C_RESET}\n"
   fi
   printf "\n"
-  printf "             ${C_BOLD}L1 readiness${C_RESET}  consensus + storage    %s  %s%%\n" "$(bar "$L1_PCT" 100 30)" "$L1_PCT"
-  printf "             ${C_BOLD}L2 readiness${C_RESET}  networking + indexing  %s  %s%%\n" "$(bar "$L2_PCT" 100 30)" "$L2_PCT"
-  printf "             ${C_BOLD}L3 readiness${C_RESET}  mining decentralise    %s  %s%%\n" "$(bar "$L3_PCT" 100 30)" "$L3_PCT"
+
+  # ----- READINESS -----
+  printf "  ${C_BOLD}READINESS${C_RESET}  ${C_DIM}hand-scored vs Bitcoin Core parity, see TODO.md${C_RESET}\n"
+  printf "             ${C_BOLD}L1${C_RESET}  consensus + storage    %s  %s%%\n" "$(bar "$L1_PCT" 100 30)" "$L1_PCT"
+  printf "             ${C_BOLD}L2${C_RESET}  networking + indexing  %s  %s%%\n" "$(bar "$L2_PCT" 100 30)" "$L2_PCT"
+  printf "             ${C_BOLD}L3${C_RESET}  mining decentralise    %s  %s%%\n" "$(bar "$L3_PCT" 100 30)" "$L3_PCT"
   printf "\n"
 
   hr

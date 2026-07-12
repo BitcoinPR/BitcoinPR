@@ -126,7 +126,7 @@ bitcoinpr-web/          # Embedded web explorer (Axum HTTP/WS)      [optional: -
 - **Configurable MOTD banner** — `--electrumbanner` sets the `server.banner` response
 - **Scripthash subscriptions** — real-time balance/transaction notifications, fired on both confirmed blocks (`NewBlock`) and unconfirmed mempool activity (`NewTx`)
 - **Mempool awareness** — scripthash status, `get_history`, `get_mempool`, and unconfirmed `get_balance` all surface mempool transactions (height `0`, or `-1` for unconfirmed parents); prevouts are resolved against the mempool, UTXO set, and tx index to detect spends
-- **Address indexing** — RocksDB-backed scripthash-to-transaction mapping with LRU block cache for fast backfill (200-entry cache, ~400 MB, auto-cleared after backfill); progress visible via `getindexinfo` RPC
+- **Address indexing** — RocksDB-backed scripthash-to-transaction mapping; backfill resolves cross-block prevouts via a rolling outpoint → (scriptPubKey, value) cache (2M entries ≈ 300 MB, seeded from each indexed block, auto-cleared after backfill) with cache misses batched through parallel tx-index lookups and partial funding-block decodes; progress visible via `getindexinfo` RPC
 - **Transaction lookup** — `blockchain.transaction.get` returns raw tx hex from mempool or tx index
 - **Transaction broadcast** — `blockchain.transaction.broadcast` accepts raw tx hex
 - **Standard methods** — `server.version`, `server.features`, `server.ping`, `blockchain.scripthash.subscribe/get_balance/listunspent/get_history/get_mempool`, `blockchain.headers.subscribe`, `blockchain.transaction.get/broadcast`, `blockchain.estimatefee`, `mempool.get_fee_histogram`
@@ -358,7 +358,7 @@ bitcoin-cli -rpcport=8332 -rpcuser=bitcoinpr -rpcpassword=bitcoinpr getblockchai
 ## Testing
 
 ```bash
-# Unit tests (279 tests across all crates)
+# Unit tests (324 tests across all crates)
 cargo test --workspace --all-features
 
 # Interop integration suite (requires Docker)
@@ -373,7 +373,7 @@ cargo test --workspace --all-features
 ./scripts/gate.sh
 ```
 
-Unit tests cover consensus params, block validation, script interpretation (incl. 5-byte `CScriptNum` for lock-time opcodes), buried-deployment activation (`deployment_active`, `csv_height`), BIP 110 RDTS (all seven rules + the P2A exemption, and the signaling state machine: full lifecycle DEFINED→ACTIVE→EXPIRED, mandatory-floor lock-in, and reorg-safety across forks), storage roundtrips, serialization, mempool operations, address management, signature caching, compact block filters, BIP 37 bloom filters (MurmurHash3 verified against Core's `bloom_tests.cpp` vectors), V2 transport, versionbits, fee estimation, mining templates, coinbase-tag injection, `MiningConfig` save/load + validation, `DatumMessage` serialization, the Datum client (solo-idle, share-queue, coinbase-output decoding), bech32m (BIP 350) taproot address vectors and scripthash derivation, UTXO flush-height recovery, undo data v2 rollback, block pruning (ceiling bounds, file/undo deletion, file-numbering survival across reopen), block store verification, and tx index height tracking. Property tests (proptest) pin the hand-rolled u256 chainwork arithmetic against a num-bigint oracle and the shared merkle module against rust-bitcoin's implementation.
+Unit tests cover consensus params, block validation, script interpretation (incl. 5-byte `CScriptNum` for lock-time opcodes), buried-deployment activation (`deployment_active`, `csv_height`), BIP 110 RDTS (all seven rules + the P2A exemption, and the signaling state machine: full lifecycle DEFINED→ACTIVE→EXPIRED, mandatory-floor lock-in, and reorg-safety across forks), storage roundtrips, serialization, mempool operations, address management, signature caching, compact block filters, BIP 37 bloom filters (MurmurHash3 verified against Core's `bloom_tests.cpp` vectors), V2 transport, versionbits, fee estimation, mining templates, coinbase-tag injection, `MiningConfig` save/load + validation, `DatumMessage` serialization, the Datum client (solo-idle, share-queue, coinbase-output decoding), bech32m (BIP 350) taproot address vectors and scripthash derivation, UTXO flush-height recovery, undo data v2 rollback, block pruning (ceiling bounds, file/undo deletion, file-numbering survival across reopen), block store verification, tx index height tracking, and cross-block prevout resolution (including the cold-cache disk path through the tx index and partial block decode). Property tests (proptest) pin the hand-rolled u256 chainwork arithmetic against a num-bigint oracle and the shared merkle module against rust-bitcoin's implementation.
 
 The interop suite verifies end-to-end block generation, P2P propagation, mempool relay, Stratum mining, and consensus agreement across a 6-node Docker cluster that deliberately mixes implementations — 2× BitcoinPR alongside Bitcoin Core 31.0, Bitcoin Knots, btcd (Go), and libbitcoin — so cross-implementation compatibility is exercised on every run (a live bitaxe ASIC can also mine the cluster's Stratum port). btcd participates as a sync/validation node (it has no built-in wallet) and is cross-checked for height and tip agreement.
 

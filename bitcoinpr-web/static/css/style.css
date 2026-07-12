@@ -1778,10 +1778,20 @@ tbody tr:hover {
     font-family: var(--font-pixel);
     font-size: 0.65rem;
     text-transform: uppercase;
+    /* Links to the public repo; keep the plain-text look, not accent. */
+    color: inherit;
 }
 
 .footer-brand strong {
     color: var(--accent);
+}
+
+a.footer-brand:hover {
+    color: inherit;
+}
+
+a.footer-brand:hover strong {
+    color: var(--accent-bright);
 }
 
 .footer-version {

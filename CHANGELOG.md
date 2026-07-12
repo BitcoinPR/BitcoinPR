@@ -5,6 +5,135 @@ Completed work, newest first (moved from TODO.md on 2026-07-11).
 > Note: `docs/archive/…` paths referenced below were removed from the repo
 > on 2026-07-11; retrieve those documents from git history.
 
+## README Accuracy Pass (2026-07-12)
+
+Verified the README's claims against the current code before the day's public
+snapshot: unit-test count refreshed (279 → 324), the Electrum "Address
+indexing" bullet updated from the retired 200-block LRU description to the
+outpoint-resolver design (rolling outpoint cache, batched tx-index lookups,
+partial funding-block decode), and the test-coverage paragraph now mentions
+cross-block prevout resolution. Everything else checked out: 26 RPC methods,
+24 outbound / 101 inbound peer targets, assume-valid at 840,000, and the CLI
+flag table.
+
+## Scripthash Backfill Efficiency (2026-07-12)
+
+The scripthash index backfill was crawling at ~9 blocks/min (~7 s/block at
+height ~400k, worsening with block size — a months-long projection for the
+remaining 556k blocks) while pinning one core and issuing ~14 GB of page-cache
+re-reads per indexed block (91 TB rchar in 12 h). Root cause: the prevout
+resolver read and **fully deserialized the entire funding block for nearly
+every cross-block input** — the old 200-block LRU had a near-zero hit rate at
+these heights, and `TxIndexEntry` carries no byte offset, so a whole-block
+parse was unavoidable per miss. Reworked `ScripthashIndex`
+(`bitcoinpr-index/src/scripthash.rs`):
+
+- **Outpoint cache instead of block cache** — the resolver LRU now maps
+  outpoint → (scriptPubKey, value) (2M entries ≈ 300 MB), seeded with every
+  indexed block's still-unspent, non-OP_RETURN outputs and popped on use (an
+  outpoint spends at most once). During sequential backfill this acts as a
+  rolling recent-UTXO set: young spends resolve with zero I/O. Cache is only
+  used when a resolver is configured, so no-`--txindex` skip semantics stay
+  deterministic.
+- **Batched, grouped, parallel disk resolution** — cache misses are resolved
+  per block in one batch: parallel txid → (block, tx_pos) tx-index lookups,
+  grouped by funding block so each distinct block is read once, then decoded
+  across up to 8 scoped threads (previously: one full block read + parse per
+  input, single-threaded).
+- **Partial block decode** — funding blocks are parsed transaction-by-
+  transaction (`deserialize_partial`) and decoding stops at the highest
+  needed tx position instead of materializing the whole block.
+- **Lock hygiene** — the resolver-cache mutex is scoped to lookups/inserts
+  only, never held across disk I/O or deserialization (it previously
+  serialized concurrent Electrum/web queries behind the backfill).
+- New test: cold-cache cross-block spend resolves via tx index + partial
+  decode (funding tx at non-zero position); existing resolver/no-resolver
+  tests unchanged and green. Backfill resumes from the last indexed height,
+  so restarting on the new binary is safe.
+
+Round 2 (same day): live monitoring after the restart showed ~1.6× (12 vs
+7.6 blocks/min) with the cache still cold, and steady-state reads of
+~4.2 GB/s — dominated not by block reads but by **tx-index point lookups**:
+`TxIndex::open` cached index/filter blocks but never set a block cache, so
+they were squeezed through RocksDB's tiny default LRU and every random txid
+get re-read (and re-verified) MB-scale filter/index blocks.
+
+- **`bitcoinpr-storage/src/tx_index.rs`** — dedicated 1 GB block cache;
+  `optimize_filters_for_hits` (resolution lookups are for txids that exist,
+  so bottom-level bloom filters rarely short-circuit anything); new
+  `get_many` batched `MultiGet` lookup.
+- **`bitcoinpr-index/src/scripthash.rs`** — resolver phase 1 deduplicates
+  funding txids (inputs often spend several outputs of one tx) and uses
+  chunked `get_many` across the worker threads instead of per-key `get`.
+
+## Log-Level Hygiene, Round 2 — WARN Triage (2026-07-12)
+
+Triaged the WARN messages seen during routine at-tip operation (20 in a
+32-minute window) and demoted the ones that describe normal behavior:
+
+- **`bitcoinpr-p2p/src/peer.rs`** — "Write error" on peer hang-up (broken
+  pipe mid-write) `warn` → `debug`; the Disconnected event drives all cleanup.
+- **`bitcoinpr/src/node.rs`** — "Header sync peer disconnected, will retry"
+  `warn` → `info` (peer churn is routine); "Header sync stalled, sending
+  getheaders to multiple peers" stays `warn` during IBD but is `info` once
+  synced (at tip it just means a quiet spell); "Clamping peer start_height"
+  `warn` → `info` (defense against lying/stale crawler nodes working as
+  designed); "Cleared stale received set" `warn` → `info` (recovery path
+  working as designed).
+- Kept as `warn`: "Slow block connect" (>5 s is worth seeing), plus the
+  head-of-line / stale-per-peer / pipeline-stall cluster — those misfire at
+  tip because staleness keys off the global `last_block_connect` timer; the
+  real fix (per-request timestamps in `BlockSync::in_flight`) is a TODO
+  follow-up rather than a demotion, since the warns are meaningful during IBD.
+
+## Small Fixes Batch (2026-07-12)
+
+Four TODO follow-ups resolved, one commit each (gate green; web changes
+smoke-tested against a live debug node):
+
+- **Web: mining-tab visibility** (`022c697`) — the `mining_enabled` check that
+  hides the Mining / Mining Config tabs ran only in the dashboard render, so a
+  full load/refresh of `#/info` or `#/mempool` on a mining-unconfigured node
+  showed the tabs until the user visited the dashboard. Now applied (with the
+  footer version, same bug) once at init on every route.
+- **Web: footer repo link** (`000c454`) — "Powered by BitcoinPR" links to
+  <https://github.com/BitcoinPR/BitcoinPR>.
+- **Dashboard script revamp** (`a463c03`) — symmetric rule + title cleanup,
+  version read from the workspace `Cargo.toml`, READINESS section with
+  refreshed scores (L1 90 / L2 85 / L3 50), and RPC URLs are
+  credential-stripped before display.
+- **Log-level hygiene** (`ba9fca6`) — periodic "Sync heartbeat" and "Pipeline
+  diagnostic" lines demoted from `info` to `debug`; one-shot transitions
+  ("IBD clear", busy/collapse warnings) keep their levels.
+
+## Chain-Work Corruption Repair & Sync Wedge Fix (2026-07-11)
+
+Fixed a mainnet-observed permanent sync wedge (commit `1493e96`): a crash left
+a header's data missing while its descendants survived, `process_headers`
+silently fell back to zero prev-work, and every later header stored cumulative
+work that restarted from zero. The tip's work collapsed below
+`nMinimumChainWork`, so header sync rotated peers forever ("empty headers below
+minimum chain work") and block download re-paused with a full queue — the node
+froze a few blocks behind tip while peers advanced.
+
+- **`bitcoinpr-p2p/src/sync.rs`** — missing prev-header data is now a hard
+  `Unconnected` error (triggers the existing gap-refetch recovery) instead of
+  silent zero work; this was the corruption source.
+- **`bitcoinpr-storage/src/header_index.rs`** — the startup integrity scan now
+  recomputes cumulative chain work over its window and rewrites mismatches,
+  extending past the validated tip to the header tip (`HeaderSync` seeds
+  `best_chain_work` from the header tip, so poisoned work up there re-wedges
+  sync — observed live at height 957648 after the first repair pass stopped at
+  the validated tip).
+- **`bitcoinpr/src/node.rs` / `main.rs`** — the min-chain-work download gate is
+  now truly monotonic: initial pause set at startup, the event loop only ever
+  opens it. The old `download_paused = !downloads_allowed` re-closed the gate
+  mid-run when `best_chain_work` collapsed.
+- **Verification** — regression tests for the missing-prev-data error path and
+  integrity-scan repair below/above the validated tip; gate green
+  (fmt/clippy/audit/machete/323 tests); fresh-cluster interop 18/18 on rebuilt
+  images. Published to public `main` as `2d4316f`.
+
 ## Tor & I2P Privacy Networking (2026-07-09)
 
 Built-in Tor and I2P transports so peer traffic can't be observed or attributed

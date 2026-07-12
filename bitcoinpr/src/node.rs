@@ -325,7 +325,7 @@ pub(crate) fn spawn_scripthash_backfill(
                 );
             }
         }
-        idx.clear_block_cache();
+        idx.clear_resolver_cache();
         info!(
             blocks_indexed = backfill_count,
             blocks_skipped = skip_count,
@@ -461,7 +461,7 @@ async fn handle_peer_disconnected(
     // If the header-sync peer left before sync finished, allow
     // the next connected peer to take over.
     if *header_sync_peer == Some(peer_id) && !header_sync.synced {
-        warn!(
+        info!(
             peer_id,
             "Header sync peer disconnected, will retry with next peer"
         );
@@ -958,9 +958,10 @@ impl Node {
         // Sync heartbeat: a detached task that logs once a minute regardless
         // of event-loop state. It distinguishes three situations that used to
         // be indistinguishable log silence: (a) normal sync between 1000-block
-        // milestones (heartbeat with height + rate), (b) a long validation /
-        // UTXO flush holding the chain-state lock ("busy" heartbeat), and
-        // (c) a wedged runtime (no heartbeat at all).
+        // milestones (heartbeat with height + rate, debug level), (b) a long
+        // validation / UTXO flush holding the chain-state lock ("busy"
+        // heartbeat, warn level), and (c) a wedged runtime (no heartbeat at
+        // all). Run with --loglevel debug to see the periodic line.
         // Approximate bytes held by `pending_blocks`, mirrored into an atomic
         // by the main loop so the detached heartbeat task can report it.
         let pending_bytes_gauge = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1004,7 +1005,7 @@ impl Node {
                                 None => (None, None, None),
                             };
                             let blocks_per_min = last_height.map(|h| height.saturating_sub(h));
-                            info!(
+                            debug!(
                                 height,
                                 blocks_per_min,
                                 rss_mb,
@@ -2810,13 +2811,25 @@ impl Node {
                             let cmd = header_sync.build_getheaders_command(t);
                             let _ = command_tx.try_send(cmd);
                         }
-                        warn!(
-                            peer_id = pid,
-                            peers_tried = targets.len(),
-                            old_peer = ?header_sync_peer,
-                            height = header_sync.best_height,
-                            "Header sync stalled, sending getheaders to multiple peers"
-                        );
+                        // During IBD a header-sync stall is a real problem;
+                        // once synced it's a routine re-poll after a quiet spell.
+                        if header_sync.synced {
+                            info!(
+                                peer_id = pid,
+                                peers_tried = targets.len(),
+                                old_peer = ?header_sync_peer,
+                                height = header_sync.best_height,
+                                "Header sync stalled, sending getheaders to multiple peers"
+                            );
+                        } else {
+                            warn!(
+                                peer_id = pid,
+                                peers_tried = targets.len(),
+                                old_peer = ?header_sync_peer,
+                                height = header_sync.best_height,
+                                "Header sync stalled, sending getheaders to multiple peers"
+                            );
+                        }
                         header_sync_peer = Some(pid);
                         getheaders_in_flight = true;
                         last_header_progress = std::time::Instant::now();
@@ -2863,7 +2876,7 @@ impl Node {
                         let mut peers = shared_peers.write().await;
                         for peer in peers.iter_mut() {
                             if peer.start_height > our_tip {
-                                warn!(
+                                info!(
                                     peer_id = peer.id,
                                     claimed_height = peer.start_height,
                                     our_height = our_tip,
@@ -3039,7 +3052,7 @@ impl Node {
                 let good_peers = count_eligible_download_peers(&peers, block_tip, header_tip);
                 drop(peers);
                 let total_pending: usize = pending_blocks.values().map(|q| q.len()).sum();
-                info!(
+                debug!(
                     in_flight = block_sync.in_flight.len(),
                     queue = block_sync.queue.len(),
                     pending = total_pending,
@@ -3237,7 +3250,7 @@ impl Node {
                 {
                     let cleared = block_sync.received.len();
                     block_sync.received.clear();
-                    warn!(cleared, "Cleared stale received set to allow re-scheduling");
+                    info!(cleared, "Cleared stale received set to allow re-scheduling");
 
                     // Force reschedule: the blocks just cleared from `received`
                     // are now eligible for schedule() again.

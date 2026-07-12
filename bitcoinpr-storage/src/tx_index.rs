@@ -1,6 +1,6 @@
 use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, Txid};
-use rocksdb::{Options, DB};
+use rocksdb::{Cache, Options, DB};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::debug;
@@ -9,6 +9,13 @@ use crate::error::{StorageError, StorageResult};
 
 /// Reserved key for storing the indexed height (not a valid txid).
 const META_INDEXED_HEIGHT: &[u8] = b"__meta__indexed_height__";
+
+/// Block cache for the tx index (data + index/filter blocks). The index is
+/// ~100 GB and each large SST carries an index/filter block in the MB range;
+/// with RocksDB's small default cache every random txid get re-reads and
+/// re-verifies megabytes of filter/index data (observed ~4 GB/s of page-cache
+/// churn during scripthash backfill). 1 GB keeps the hot set resident.
+const TXINDEX_BLOCK_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Entry in the transaction index: maps txid → (block_hash, tx_position).
 #[derive(Debug, Clone)]
@@ -62,7 +69,17 @@ impl TxIndex {
         table_opts.set_block_size(16 * 1024);
         table_opts.set_cache_index_and_filter_blocks(true);
         table_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        // Dedicated cache — index/filter blocks are cached (above), so they
+        // must not be squeezed through RocksDB's tiny default LRU.
+        let block_cache = Cache::new_lru_cache(TXINDEX_BLOCK_CACHE_BYTES);
+        table_opts.set_block_cache(&block_cache);
         opts.set_block_based_table_factory(&table_opts);
+        // Nearly all lookups are for txids that exist (prevout resolution of
+        // confirmed spends, explorer/RPC lookups of known txids), so
+        // bottom-level bloom filters rarely short-circuit anything — skipping
+        // them frees most of the filter footprint for the levels where
+        // filters do help.
+        opts.set_optimize_filters_for_hits(true);
         let db = DB::open(&opts, path)?;
         Ok(TxIndex { db: Arc::new(db) })
     }
@@ -74,6 +91,23 @@ impl TxIndex {
             Some(data) => Ok(Some(TxIndexEntry::deserialize(&data)?)),
             None => Ok(None),
         }
+    }
+
+    /// Batched lookup: one RocksDB `MultiGet` for many txids. RocksDB groups
+    /// the keys per SST internally, sharing index/filter block loads that
+    /// per-key `get()` calls would repeat. Lookup or decode failures yield
+    /// `None` in the corresponding slot (callers treat missing entries as
+    /// unresolvable, matching `get`'s error-tolerant call sites).
+    pub fn get_many(&self, txids: &[Txid]) -> Vec<Option<TxIndexEntry>> {
+        let keys = txids.iter().map(AsRef::<[u8; 32]>::as_ref);
+        self.db
+            .multi_get(keys)
+            .into_iter()
+            .map(|res| match res {
+                Ok(Some(data)) => TxIndexEntry::deserialize(&data).ok(),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Index all transactions in a block.
