@@ -46,12 +46,17 @@ pub async fn get_info(State(state): State<WebState>) -> Json<Value> {
     let peer_count = state.peers.read().await.len();
 
     // On-disk usage per datadir component; walked off the async executor.
+    // Undo-CF size is read up front (cheap in-memory RocksDB property) so
+    // the breakdown can split the utxo directory into utxo/undo buckets.
     let storage = match state.datadir.clone() {
         Some(dir) => {
             let blocks_dir = state.blocks_dir.clone();
-            tokio::task::spawn_blocking(move || storage_breakdown(&dir, blocks_dir.as_deref()))
-                .await
-                .unwrap_or_default()
+            let undo_bytes = state.utxo_set.cf_disk_sizes().1;
+            tokio::task::spawn_blocking(move || {
+                storage_breakdown(&dir, blocks_dir.as_deref(), undo_bytes)
+            })
+            .await
+            .unwrap_or_default()
         }
         None => vec![],
     };
@@ -90,7 +95,20 @@ pub async fn get_info(State(state): State<WebState>) -> Json<Value> {
 /// (logs, mempool.dat, ...). When the block files live outside the datadir
 /// (--blocksdir), they are counted explicitly so the breakdown still shows
 /// them. Sorted largest-first.
-fn storage_breakdown(datadir: &Path, blocks_dir: Option<&Path>) -> Vec<(String, u64)> {
+///
+/// The `utxo/` RocksDB holds two very different things — the live UTXO set
+/// (`utxo` CF) and never-pruned per-block undo records (`undo` CF, an order
+/// of magnitude larger; Core's equivalent lives in blocks/rev*.dat) — so a
+/// single "utxo" number made the UTXO set look ~17x oversized.
+/// `undo_sst_bytes` (the undo CF's total SST size, from the caller) is
+/// carved out of the directory total into its own "undo" bucket; the
+/// remainder (utxo CF SSTs plus shared WAL/meta files) stays "utxo", so the
+/// two buckets still sum to the directory's real on-disk footprint.
+fn storage_breakdown(
+    datadir: &Path,
+    blocks_dir: Option<&Path>,
+    undo_sst_bytes: u64,
+) -> Vec<(String, u64)> {
     let mut out: Vec<(String, u64)> = Vec::new();
     let mut loose_files: u64 = 0;
 
@@ -101,7 +119,14 @@ fn storage_breakdown(datadir: &Path, blocks_dir: Option<&Path>) -> Vec<(String, 
         let Ok(meta) = entry.metadata() else { continue };
         if meta.is_dir() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            out.push((name, dir_size(&entry.path(), 0)));
+            let size = dir_size(&entry.path(), 0);
+            if name == "utxo" && undo_sst_bytes > 0 {
+                let undo = undo_sst_bytes.min(size);
+                out.push(("undo".to_string(), undo));
+                out.push((name, size - undo));
+            } else {
+                out.push((name, size));
+            }
         } else {
             loose_files += meta.len();
         }

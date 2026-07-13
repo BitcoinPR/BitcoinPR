@@ -6,6 +6,7 @@ pub mod protocol;
 pub mod shares;
 pub mod stats;
 pub mod template_provider;
+pub mod vardiff;
 
 pub use config::{DatumConfig, MiningConfig, MiningMode};
 pub use datum::{CoinbaseOutput, DatumClient, DatumShare, DatumStatus, PayoutInfo};

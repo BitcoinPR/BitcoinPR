@@ -24,10 +24,12 @@ def compact_to_target(bits):
 
 
 def stratum_prevhash_to_internal(h):
-    # notify prevhash = internal bytes, 4-byte chunks in reverse chunk order.
+    # Canonical Stratum V1 prevhash (template_prev_hash_stratum): internal LE
+    # header words in order, bytes swapped within each 4-byte word. Undo the
+    # per-word swap (same op as ESP-Miner/cgminer swap_endian_words) to
+    # recover the internal bytes.
     b = bytes.fromhex(h)
-    chunks = [b[i:i+4] for i in range(0, 32, 4)]
-    return b"".join(reversed(chunks))
+    return b"".join(b[i:i+4][::-1] for i in range(0, 32, 4))
 
 
 def main():

@@ -5,6 +5,118 @@ Completed work, newest first (moved from TODO.md on 2026-07-11).
 > Note: `docs/archive/…` paths referenced below were removed from the repo
 > on 2026-07-11; retrieve those documents from git history.
 
+## Stratum Vardiff: Per-Worker Share Difficulty Ramping (2026-07-13)
+
+The stratum gateway used to send a single static `mining.set_difficulty`
+(65536, or a `--miningdifficulty` override), badly matched to small ASICs:
+a ~450 GH/s bitaxe averaged one share per ~10.4 min — the same length as the
+`ShareTracker` 10-min rolling window — so the dashboard flapped between
+0 H/s and a single-share estimate and the worker list stayed empty. Now each
+V1 connection runs classic vardiff (`bitcoinpr-mining/src/vardiff.rs`):
+start at difficulty 512 (or the miner's `mining.suggest_difficulty`,
+clamped, which is now honored instead of ack-and-ignored — including
+mid-session), then retarget toward ~1 share per 15 s with a [7.5 s, 30 s]
+dead band and a ×4/÷4 per-step clamp. Ramp-up is driven by the observed rate
+(evaluated every 4 accepted shares); ramp-down by a 30 s session tick that
+treats 60+ s of silence as a too-high difficulty, so a miner that never
+clears the current floor still converges. Difficulty is capped at the
+network difficulty (tracking chain retargets) and floored at 0.001. Every
+retarget pushes `set_difficulty` plus a fresh clean job so the miner applies
+it immediately. Share difficulty remains a submit-rate filter only — block
+detection still checks the header hash against the job's real nBits target,
+so ramping can never lose a block.
+
+`--miningdifficulty` now means "pin the share difficulty, vardiff disabled"
+(unchanged behavior otherwise); on trivial-difficulty chains (regtest,
+network difficulty below the vardiff floor) the gateway keeps the old
+static network-difficulty behavior, where every share is a block. The
+interop cluster's `--miningdifficulty 70000` pin stays in
+`docker-compose.interop.yml` deliberately: a live bitaxe mines that cluster,
+and on regtest the share difficulty is really a block-cadence policy (~1
+block/10 min at 450 GH/s) — removing the pin during this work turned the
+bitaxe into a block-per-second firehose (~590 blocks in minutes, two subsidy
+halvings, 5 interop tests broken by the racing chain) until it was restored.
+Auto-ramping can't replace the pin there: vardiff targeting ~1 share/15 s
+would still mean 4 blocks/min of chain pollution. 10 unit tests in
+vardiff.rs.
+
+## Web Storage Breakdown: Undo Split Out of "utxo" (2026-07-13)
+
+The Info page's per-directory disk usage reported `utxo/` as one ~249 GiB
+number, but that RocksDB holds two very different things: the live UTXO
+set (`utxo` CF, ~16 GB — comparable to Core's ~13 GB chainstate) and
+never-pruned per-block undo records (`undo` CF, ~230 GB; Core's equivalent
+lives in blocks/rev*.dat). Labeling the whole directory "utxo" made the
+UTXO set look ~17x oversized. `UtxoSet::cf_disk_sizes()` now exposes
+per-CF SST totals (`rocksdb.total-sst-files-size`), and `storage_breakdown`
+(bitcoinpr-web/src/api/info.rs) carves the undo CF's bytes out of the
+directory total into a separate "undo" bucket — the remainder (utxo CF
+plus shared WAL/meta) stays "utxo", so the buckets still sum to the real
+on-disk footprint. Follow-up in TODO.md: prune undo records beyond a
+reorg-safe depth to reclaim most of that 230 GB.
+
+## Unconnecting-Header Getheaders Loop Cap (2026-07-13)
+
+A bogus peer (`/Satoshi:0.12.0/`, claimed height 1,194,990, serving
+low-difficulty headers from a foreign chain) locked the node in a
+`getheaders` ping-pong for ~2 min at ~7 msgs/sec on 2026-07-12: every
+unconnecting header (`HeaderSyncError::Unconnected`) triggered an
+unconditional re-`getheaders` to the same peer, whose response didn't
+connect either — no rate limit, no penalty. Now `HeaderSync` keeps a
+per-peer counter of consecutive unconnecting-header messages
+(`MAX_UNCONNECTING_HEADERS = 10`, Core's cap): below the cap the gap-fill
+re-request behaves as before; at and beyond it the node stops re-requesting
+and applies a new `Misbehavior::UnconnectingHeaders` penalty (20 points)
+on every cap multiple, so a persistent offender walks itself to the
+100-point ban. The counter resets as soon as one of the peer's headers
+connects, and is dropped on disconnect. The post-sync "Clamping peer
+start_height" path (a peer claiming a higher chain it cannot serve) feeds
+the same penalty.
+
+## Stratum Prevhash Byte-Order Fix (2026-07-13)
+
+A bitaxe (~450 GH/s) pointed at the solo-mining stratum gateway showed
+"1 connected worker" but an empty worker list, 0 H/s, and — after lowering
+the share difficulty from the default 65536 to 1000 via `--miningdifficulty`
+— every submitted share rejected as "Low difficulty share". The rejected
+shares' server-computed difficulties (visible in `/api/mining/history`) were
+all ~4e-10, i.e. uniformly random hashes: the server was reconstructing a
+different header than the miner mined. Root cause:
+`template_prev_hash_stratum` (`bitcoinpr-mining/src/template_provider.rs`)
+emitted the `mining.notify` prevhash in reversed-chunk order instead of the
+canonical Stratum V1 encoding (LE header words in order, bytes swapped
+within each word — canonical strings end with the zero run, ours started
+with it). Miners build their headers from that string, so the per-word swap
+they apply (`swap_endian_words`) yielded display-order prevhash bytes and no
+submit could ever match the server's reconstruction from the true
+`prev_hash`.
+
+The function had been flipped *into* the broken state by an earlier "fix"
+that misdiagnosed a miner showing "BLOCK FOUND" without submitting — that
+symptom was actually the static 65536 share-difficulty throttle (~1 share
+per 10.4 min at 450 GH/s, the same length as the tracker's 10-min rolling
+window). The flip was invisible on regtest, where a wrongly reconstructed
+header still beats the trivial target ~50% of the time and the
+server-assembled block (built with the correct prevhash) validates — which
+also explains the long-standing regtest oddity of accepted shares and
+connected blocks alongside a 0 H/s dashboard (shares were credited ~4e-10
+actual difficulty).
+
+Fixed the encoding, corrected the genesis unit test (it asserted the wrong
+convention), and added a mainnet regression vector pinning the
+zero-run-at-end property. Verified live: bitaxe reconnected and produced
+7 accepted / 0 rejected shares in the first minute at diff 1000, worker list
+and hashrate populated. Follow-up (TODO): per-worker vardiff instead of the
+static difficulty cap.
+
+Follow-up (2026-07-13, same day): `scripts/sv1_mine_one.py` was missed in
+this fix — it still decoded the notify prevhash in the old reversed-chunk
+order, so after the server switched to the canonical encoding the script
+mined a wrongly reconstructed header, and interop test 10 became a ~50%
+coin flip (the server's differing reconstruction still meets the trivial
+regtest target about half the time). Updated the script to undo the
+canonical per-word swap; 3/3 deterministic accepts verified.
+
 ## README Accuracy Pass (2026-07-12)
 
 Verified the README's claims against the current code before the day's public

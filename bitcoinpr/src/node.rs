@@ -430,11 +430,14 @@ async fn handle_peer_disconnected(
     header_index: &Arc<HeaderIndex>,
     command_tx: &mpsc::Sender<PeerCommand>,
     block_sync: &mut BlockSync,
-    header_sync: &HeaderSync,
+    header_sync: &mut HeaderSync,
     header_sync_peer: &mut Option<u64>,
     #[cfg(feature = "web")] web_peers: &Arc<RwLock<Vec<bitcoinpr_web::PeerEntry>>>,
 ) {
     debug!(peer_id, "Peer disconnected");
+    // Drop any unconnecting-headers strike counter so the map only tracks
+    // connected peers.
+    header_sync.reset_unconnecting(peer_id);
     shared_peers.write().await.retain(|p| p.id != peer_id);
     #[cfg(feature = "web")]
     web_peers.write().await.retain(|p| p.id != peer_id);
@@ -1123,7 +1126,7 @@ impl Node {
                                 &header_index,
                                 &command_tx,
                                 &mut block_sync,
-                                &header_sync,
+                                &mut header_sync,
                                 &mut header_sync_peer,
                                 #[cfg(feature = "web")]
                                 &web_peers,
@@ -1239,6 +1242,9 @@ impl Node {
                                 Ok(accepted) => {
                                     let tip_advanced = header_sync.best_height > prev_best_height;
                                     if accepted > 0 {
+                                        // The peer's headers connect — clear its
+                                        // unconnecting-headers strike counter.
+                                        header_sync.reset_unconnecting(peer_id);
                                         // Update the peer's known height in shared_peers.
                                         // start_height from the version handshake is stale
                                         // (reflects height at connect time, not now).  Every
@@ -1764,12 +1770,38 @@ impl Node {
                                     // (e.g. we missed earlier announcements while
                                     // the peer was catching up, or across our own
                                     // restart). Ask the peer for headers from our
-                                    // tip so the gap fills; no penalty, this is a
-                                    // normal relay race (Core's unconnecting-
-                                    // headers handling).
-                                    info!(peer_id, %msg, "Unconnecting header announcement — sending getheaders to fill the gap");
-                                    let cmd = header_sync.build_getheaders_command(peer_id);
-                                    let _ = command_tx.try_send(cmd);
+                                    // tip so the gap fills; this is a normal relay
+                                    // race (Core's unconnecting-headers handling).
+                                    //
+                                    // But a peer on a foreign chain answers that
+                                    // getheaders with headers that don't connect
+                                    // either, turning the exchange into an
+                                    // unbounded ping-pong (observed 2026-07-12 at
+                                    // ~7 msgs/sec). So count consecutive
+                                    // unconnecting messages per peer: past the
+                                    // cap, stop re-requesting and penalize every
+                                    // cap-multiple so a persistent offender walks
+                                    // itself to a ban. The counter resets as soon
+                                    // as one of the peer's headers connects.
+                                    let count = header_sync.note_unconnecting(peer_id);
+                                    if count < bitcoinpr_p2p::MAX_UNCONNECTING_HEADERS {
+                                        info!(peer_id, %msg, count, "Unconnecting header announcement — sending getheaders to fill the gap");
+                                        let cmd = header_sync.build_getheaders_command(peer_id);
+                                        let _ = command_tx.try_send(cmd);
+                                    } else {
+                                        warn!(
+                                            peer_id,
+                                            %msg,
+                                            count,
+                                            "Too many consecutive unconnecting headers — not re-requesting"
+                                        );
+                                        if count % bitcoinpr_p2p::MAX_UNCONNECTING_HEADERS == 0 {
+                                            let _ = command_tx.try_send(PeerCommand::Misbehaving {
+                                                peer_id,
+                                                reason: bitcoinpr_p2p::Misbehavior::UnconnectingHeaders,
+                                            });
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     warn!(peer_id, "Header sync error: {}", e);
@@ -2884,6 +2916,13 @@ impl Node {
                                     "Clamping peer start_height — peer could not provide headers above our tip"
                                 );
                                 peer.start_height = our_tip;
+                                // Claiming a chain it cannot serve is the same
+                                // offense as serving unconnecting headers —
+                                // score it so repeat offenders get banned.
+                                let _ = command_tx.try_send(PeerCommand::Misbehaving {
+                                    peer_id: peer.id,
+                                    reason: bitcoinpr_p2p::Misbehavior::UnconnectingHeaders,
+                                });
                             }
                         }
                         drop(peers);

@@ -605,6 +605,27 @@ impl UtxoSet {
         }
     }
 
+    /// On-disk SST bytes of the `utxo` and `undo` column families, in that
+    /// order (RocksDB `rocksdb.total-sst-files-size` per CF). The two CFs
+    /// share one database directory but hold very different data — the live
+    /// UTXO set vs. never-pruned per-block undo records (Core's equivalent
+    /// lives in blocks/rev*.dat) — so storage reporting wants them split.
+    /// Cheap in-memory property reads; 0 for a missing CF or property.
+    pub fn cf_disk_sizes(&self) -> (u64, u64) {
+        let sst_bytes = |name: &str| {
+            self.db
+                .cf_handle(name)
+                .and_then(|cf| {
+                    self.db
+                        .property_int_value_cf(cf, "rocksdb.total-sst-files-size")
+                        .ok()
+                        .flatten()
+                })
+                .unwrap_or(0)
+        };
+        (sst_bytes(CF_UTXO), sst_bytes(CF_UNDO))
+    }
+
     /// Evict random entries when the cache grows beyond capacity.
     fn maybe_evict_cache(&self) {
         let len = self.cache.len();

@@ -37,6 +37,14 @@ Completed work lives in [CHANGELOG.md](CHANGELOG.md).
   timestamps and escalate/clear only requests that are actually old, keeping
   the warns meaningful during IBD.
 
+- [ ] **Prune undo records beyond a reorg-safe depth** — the `undo` CF of
+  the utxo RocksDB (~230 GB, now reported as its own "undo" bucket on the
+  web Info page) keeps per-block undo records forever, but they are only
+  needed to disconnect blocks during a reorg. Deleting records deeper than
+  a reorg-safe depth (a few thousand blocks) would reclaim most of that
+  230 GB. Core keeps the equivalent in `rev*.dat` and prunes it with block
+  files.
+
 ### SV2 / Datum Mining Gateway
 
 The Datum runtime-config, Datum client, and Datum web UI are complete (see the

@@ -118,10 +118,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) miningaddress: Option<String>,
 
-    /// Override block difficulty for mined blocks (Bitcoin-style difficulty number).
-    /// Use this to target a specific inter-block time with a known miner hashrate.
-    /// Example: --miningdifficulty 70000  targets ~10 min at ~500 GH/s.
-    /// Regtest never auto-retargets, so without this every hash is a valid block.
+    /// Pin the Stratum share difficulty (Bitcoin-style difficulty number),
+    /// disabling per-worker vardiff. Without it, each connection's share
+    /// difficulty ramps automatically toward ~1 share per 15 s.
+    /// Never changes block nBits — mined blocks stay consensus-valid.
+    /// Example: --miningdifficulty 70000 ≈ 1 share per 10 min at 500 GH/s.
     #[arg(long)]
     pub(crate) miningdifficulty: Option<f64>,
 

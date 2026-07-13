@@ -21,6 +21,10 @@ const BANLIST_FORMAT_VERSION: u32 = 1;
 pub enum Misbehavior {
     /// Sent an invalid block header.
     InvalidHeader,
+    /// Kept sending headers that don't connect to anything we know
+    /// (applied once per `MAX_UNCONNECTING_HEADERS` consecutive messages,
+    /// mirroring Core's unconnecting-headers throttle).
+    UnconnectingHeaders,
     /// Sent a block that failed validation.
     InvalidBlock,
     /// Sent an invalid transaction.
@@ -40,6 +44,7 @@ impl Misbehavior {
     pub fn score(self) -> u32 {
         match self {
             Misbehavior::InvalidHeader => 20,
+            Misbehavior::UnconnectingHeaders => 20,
             Misbehavior::InvalidBlock => 100,
             Misbehavior::InvalidTransaction => 10,
             Misbehavior::MessageFlooding => 50,

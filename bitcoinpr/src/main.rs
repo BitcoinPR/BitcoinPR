@@ -1166,7 +1166,7 @@ async fn main() -> anyhow::Result<()> {
             info!(
                 difficulty = miningdifficulty.unwrap(),
                 share_target_nbits = format!("{:#010x}", nbits),
-                "Share difficulty throttle active (block nBits unchanged for peer compatibility)"
+                "Share difficulty pinned via --miningdifficulty (vardiff disabled; block nBits unchanged)"
             );
         }
         let template_provider = bitcoinpr_mining::TemplateProvider::new(

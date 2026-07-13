@@ -31,5 +31,5 @@ pub use netaddr::{AddrNetwork, NetAddr};
 pub use peer::{PeerId, PeerInfo};
 pub use scoring::{Misbehavior, PeerScoring};
 pub use socks5::ProxyConfig;
-pub use sync::{BlockSync, HeaderSync, HeaderSyncError};
+pub use sync::{BlockSync, HeaderSync, HeaderSyncError, MAX_UNCONNECTING_HEADERS};
 pub use tor::{create_hidden_service, HiddenService, TorConfig};

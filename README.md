@@ -270,7 +270,7 @@ minerd -a sha256d -o stratum+tcp://127.0.0.1:3333 -u worker -p x
 ```
 
 The mining gateway:
-- Sends `mining.set_difficulty` (auto-capped at 65,536 for consumer ASICs on mainnet; override with `--miningdifficulty`) and `mining.notify` jobs from the current chain tip
+- Sends `mining.set_difficulty` (per-worker vardiff: starts at 512 or the miner's `suggest_difficulty` and ramps toward ~1 share/15 s; pin a fixed value with `--miningdifficulty`) and `mining.notify` jobs from the current chain tip
 - Pushes new jobs immediately when a new block is seen on the network; mempool changes throttled to every 30s to reduce stale shares
 - Validates submitted shares against the share difficulty floor and tracks per-worker hashrate; rejects low-difficulty and stale shares with proper stratum error codes (23/21)
 - If a share meets the network difficulty target, the block is assembled, validated, and broadcast
@@ -314,7 +314,7 @@ bitcoin-cli -rpcport=8332 -rpcuser=bitcoinpr -rpcpassword=bitcoinpr getmininginf
 | `--mining` | off | Enable mining gateway |
 | `--miningport` | 3333 | Mining gateway TCP port |
 | `--miningaddress` | OP_TRUE | Coinbase payout address (e.g. `tb1q...`) |
-| `--miningdifficulty` | (auto) | Override share difficulty for `mining.set_difficulty`; without this, defaults to `min(network_difficulty, 65536)` so consumer ASICs get a reachable target |
+| `--miningdifficulty` | (vardiff) | Pin the share difficulty for `mining.set_difficulty`, disabling vardiff; without this, each worker's difficulty ramps automatically toward ~1 share per 15 s |
 | `--coinbasetag` | `/BitcoinPR/` | Coinbase scriptSig tag (pool attribution, ≤ 80 bytes) |
 | `--poolname` | `BitcoinPR` | Pool attribution name |
 | `--disableipv6` | off | Disable IPv6 peer connections |

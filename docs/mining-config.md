@@ -44,7 +44,7 @@ oversized tags are truncated with a warning.
 | `--miningaddress <addr>` | Coinbase payout address (default OP_TRUE) |
 | `--coinbasetag <string>` | Coinbase scriptSig tag (default `/BitcoinPR/`) |
 | `--poolname <string>` | Pool attribution name |
-| `--miningdifficulty <f64>` | Stratum share-difficulty throttle (does not change block nBits) |
+| `--miningdifficulty <f64>` | Pin the Stratum share difficulty, disabling per-worker vardiff (does not change block nBits) |
 
 `bitcoinpr.conf` accepts the same keys (`coinbasetag=`, `poolname=`, …).
 

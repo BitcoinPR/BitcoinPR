@@ -45,6 +45,15 @@ impl std::fmt::Display for HeaderSyncError {
 
 impl std::error::Error for HeaderSyncError {}
 
+/// Consecutive unconnecting-header messages from one peer before we stop
+/// replying with `getheaders` and start scoring it (Core's
+/// `MAX_NUM_UNCONNECTING_HEADERS_MSGS`). Without a cap, a peer serving
+/// headers from a foreign chain locks the node in a getheaders ping-pong:
+/// every unconnecting announcement triggers an unconditional re-request,
+/// whose response doesn't connect either (observed 2026-07-12: ~7 msgs/sec
+/// for ~2 min from a bogus /Satoshi:0.12.0/ peer).
+pub const MAX_UNCONNECTING_HEADERS: u32 = 10;
+
 /// Manages header-first synchronization.
 pub struct HeaderSync {
     params: ConsensusParams,
@@ -57,6 +66,10 @@ pub struct HeaderSync {
     pub best_chain_work: [u8; 32],
     /// Whether we've completed initial header sync.
     pub synced: bool,
+    /// Consecutive unconnecting-header messages per peer. Entries are
+    /// removed when a peer's headers connect or it disconnects, so the map
+    /// only holds currently-misbehaving peers.
+    unconnecting: std::collections::HashMap<PeerId, u32>,
 }
 
 impl HeaderSync {
@@ -79,7 +92,24 @@ impl HeaderSync {
             best_hash,
             best_chain_work,
             synced: false,
+            unconnecting: std::collections::HashMap::new(),
         }
+    }
+
+    /// Record one more unconnecting-header message from `peer_id` and return
+    /// the new consecutive count. The caller should stop re-requesting
+    /// headers once the count reaches `MAX_UNCONNECTING_HEADERS` and apply a
+    /// misbehavior penalty on every multiple of it.
+    pub fn note_unconnecting(&mut self, peer_id: PeerId) -> u32 {
+        let count = self.unconnecting.entry(peer_id).or_insert(0);
+        *count = count.saturating_add(1);
+        *count
+    }
+
+    /// Clear the unconnecting-header counter for `peer_id` — call when a
+    /// headers message from that peer connects, or when it disconnects.
+    pub fn reset_unconnecting(&mut self, peer_id: PeerId) {
+        self.unconnecting.remove(&peer_id);
     }
 
     /// Whether the best header chain's cumulative work meets the network's
@@ -1263,6 +1293,27 @@ mod header_sync_tests {
         let accepted = sync.process_headers(&[h1, h2], 0).unwrap();
         assert_eq!(accepted, 2);
         assert_eq!(sync.best_height, 2);
+    }
+
+    /// The per-peer unconnecting-headers counter must increment per strike,
+    /// track peers independently, and clear on reset — the node.rs handler
+    /// relies on it to break the getheaders ping-pong with foreign-chain
+    /// peers (2026-07-12 incident).
+    #[test]
+    fn unconnecting_counter_tracks_per_peer_and_resets() {
+        let params = retargeting_params();
+        let (_dir, index) = open_index();
+        let mut sync = sync_at_genesis(&params, &index);
+
+        for expected in 1..=MAX_UNCONNECTING_HEADERS {
+            assert_eq!(sync.note_unconnecting(7), expected);
+        }
+        // Independent counter for another peer.
+        assert_eq!(sync.note_unconnecting(8), 1);
+        // Reset clears only the targeted peer.
+        sync.reset_unconnecting(7);
+        assert_eq!(sync.note_unconnecting(7), 1);
+        assert_eq!(sync.note_unconnecting(8), 2);
     }
 
     /// Build and insert an unmined chain of `count` headers on top of genesis

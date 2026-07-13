@@ -71,6 +71,13 @@ services:
   bitcoinpr1:
     <<: *bitcoinpr-full
     container_name: interop-bitcoinpr1
+    # --miningdifficulty 70000 must STAY pinned here: a live bitaxe (~450 GH/s)
+    # mines this cluster via :3333, and on regtest every submitted share that
+    # meets the trivial network target IS a block. The pin sets the miner-side
+    # submission rate (~1 block per 10 min); removing it (or any auto/vardiff
+    # setting) turns the bitaxe into a block-per-second firehose that ages the
+    # chain past subsidy halvings and races the interop tests. Vardiff is
+    # intentionally inactive on trivial-difficulty chains — see vardiff.rs.
     command: >
       --network regtest
       --datadir /data/bitcoinpr

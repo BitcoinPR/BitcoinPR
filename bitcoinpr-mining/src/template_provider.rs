@@ -33,11 +33,12 @@ use crate::protocol::{
     Sv2Message,
 };
 use crate::shares::ShareTracker;
+use crate::vardiff::{Vardiff, VARDIFF_MIN, VARDIFF_START, VARDIFF_TICK_SECS};
 
-/// Default share difficulty cap for solo mining. When no `--miningdifficulty`
-/// override is set, `mining.set_difficulty` is capped at this value so consumer
-/// ASICs (e.g. bitaxe at ~500 GH/s) can produce shares at a reasonable rate.
-/// On regtest the network difficulty is already tiny, so the cap is a no-op.
+/// Legacy share-difficulty cap, kept as a safety bound for the non-vardiff
+/// static regime. Real networks now use per-connection vardiff (vardiff.rs)
+/// instead of this single static value; on regtest the network difficulty is
+/// far below the cap, so it is a no-op there too.
 const DEFAULT_SHARE_DIFFICULTY: f64 = 65536.0;
 
 /// Interval between mempool-driven job rebuilds. 30 seconds matches standard
@@ -45,11 +46,14 @@ const DEFAULT_SHARE_DIFFICULTY: f64 = 65536.0;
 /// refresh. New blocks still trigger immediate job pushes (separate code path).
 const MEMPOOL_RETEMPLATE_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Compute the share difficulty to send via `mining.set_difficulty`.
+/// Compute the share difficulty for the two non-vardiff regimes.
 ///
-/// Priority: CLI `--miningdifficulty` override (via `bits_override`) wins.
-/// Otherwise, cap at [`DEFAULT_SHARE_DIFFICULTY`] so mainnet miners get a
-/// workable target instead of the full network difficulty (~125 T).
+/// Priority: CLI `--miningdifficulty` override (via `bits_override`) pins the
+/// share difficulty for the whole session (vardiff disabled). Otherwise cap
+/// at [`DEFAULT_SHARE_DIFFICULTY`] — in practice this branch is only reached
+/// on trivial-difficulty chains (regtest), where the network difficulty is
+/// far below the cap and every share is a block; on real networks the session
+/// uses per-connection vardiff instead (see `vardiff.rs`).
 fn effective_share_difficulty(bits_override: Option<u32>, template_bits: u32) -> f64 {
     if let Some(bits) = bits_override {
         return compact_target_to_difficulty(bits);
@@ -1119,6 +1123,7 @@ async fn handle_v1_session(
     // --- Handle pre-authorize messages (configure, suggest_difficulty) then authorize ---
     // Miners may send mining.configure and/or mining.suggest_difficulty before authorize.
     let worker_name;
+    let mut suggested_difficulty: Option<f64> = None;
     loop {
         let line = match lines.next_line().await? {
             Some(l) => l,
@@ -1178,7 +1183,9 @@ async fn handle_v1_session(
                 debug!(%addr, "V1 mining.configure acknowledged");
             }
             "mining.suggest_difficulty" => {
-                // Acknowledge but keep our pool difficulty at 1
+                // Acknowledge and remember the value — it seeds vardiff's
+                // starting difficulty once the session begins.
+                suggested_difficulty = parse_suggested_difficulty(&rpc.params);
                 send_json(
                     writer,
                     &JsonRpcResponse {
@@ -1188,7 +1195,7 @@ async fn handle_v1_session(
                     },
                 )
                 .await?;
-                debug!(%addr, "V1 mining.suggest_difficulty acknowledged");
+                debug!(%addr, suggested = ?suggested_difficulty, "V1 mining.suggest_difficulty received");
             }
             other => {
                 debug!(%addr, method = other, "Unexpected method during handshake, acking");
@@ -1284,18 +1291,39 @@ async fn handle_v1_session(
     .await;
 
     // --- Send mining.set_difficulty ---
-    // If --miningdifficulty was set, use that to throttle share submission rate
-    // (e.g. difficulty=70000 → ~1 share per 10 min at 1.5 TH/s).  The block
-    // nBits in the template is always the consensus value (0x207fffff in regtest)
-    // so peers accept the mined block regardless of share difficulty.
-    // If no override, just send the block difficulty so the miner works at the
-    // natural chain difficulty.
-    let mut current_share_difficulty = effective_share_difficulty(bits_override, template.bits);
+    // Three share-difficulty regimes (none of them ever changes the block
+    // nBits — templates always carry the consensus value so peers accept
+    // mined blocks):
+    //   pinned  — --miningdifficulty set: fixed for the whole session
+    //             (e.g. 70000 → ~1 share per 10 min at 1.5 TH/s).
+    //   static  — network difficulty at or below the vardiff floor (regtest):
+    //             shares ARE blocks there, nothing to ramp.
+    //   vardiff — real networks: per-connection ramping toward ~1 share/15 s
+    //             (vardiff.rs), seeded from the miner's suggest_difficulty
+    //             when it sent one.
+    let net_difficulty = compact_target_to_difficulty(template.bits);
+    let mut vardiff = (bits_override.is_none() && net_difficulty > VARDIFF_MIN).then(|| {
+        Vardiff::new(
+            suggested_difficulty.unwrap_or(VARDIFF_START),
+            net_difficulty,
+            Instant::now(),
+        )
+    });
+    let mut current_share_difficulty = match &vardiff {
+        Some(v) => v.difficulty(),
+        None => effective_share_difficulty(bits_override, template.bits),
+    };
     if bits_override.is_some() {
         info!(
             share_difficulty = current_share_difficulty,
             block_bits = format!("{:#010x}", template.bits),
-            "Using custom share difficulty (block nBits unchanged for peer compatibility)"
+            "Using pinned share difficulty (vardiff disabled; block nBits unchanged for peer compatibility)"
+        );
+    } else if vardiff.is_some() {
+        info!(
+            %addr,
+            start_difficulty = current_share_difficulty,
+            "Vardiff active — ramping toward ~1 share/15s per worker"
         );
     }
     send_json(
@@ -1317,6 +1345,12 @@ async fn handle_v1_session(
 
     send_v1_notify(writer, &current_job, true).await?;
     let mut job_counter: u64 = 2;
+
+    // Drives Vardiff::on_tick — the ramp-DOWN path. A miner too small for the
+    // current difficulty may never submit a share, so rate observation alone
+    // (on_share) can't lower it; this tick uses elapsed silence instead.
+    let mut vardiff_tick = tokio::time::interval(Duration::from_secs(VARDIFF_TICK_SECS));
+    vardiff_tick.tick().await; // consume the immediate first tick
 
     // --- Main loop ---
     loop {
@@ -1379,6 +1413,27 @@ async fn handle_v1_session(
                                         }
                                     }
                                 }
+
+                                // Vardiff ramp-up: retarget from the observed
+                                // share rate and push the change with a fresh job.
+                                if accepted {
+                                    if let Some(new_diff) = vardiff
+                                        .as_mut()
+                                        .and_then(|v| v.on_share(Instant::now()))
+                                    {
+                                        current_share_difficulty = new_diff;
+                                        current_job = send_v1_retarget(
+                                            writer, new_diff, &current_template,
+                                            &extranonce1, extranonce2_size,
+                                            &coinbase_script, &mut job_counter,
+                                        ).await?;
+                                        info!(
+                                            %addr, worker = %worker_name,
+                                            difficulty = new_diff, job_id = %current_job.job_id,
+                                            "Vardiff retarget (observed share rate)"
+                                        );
+                                    }
+                                }
                             }
                             "mining.authorize" => {
                                 send_json(writer, &JsonRpcResponse {
@@ -1416,12 +1471,29 @@ async fn handle_v1_session(
                             }
                             "mining.suggest_difficulty" => {
                                 // Miner may re-send this after authorize; acknowledge
-                                // with success so firmware doesn't stall on an error.
+                                // with success so firmware doesn't stall on an error,
+                                // and honor it (clamped) when vardiff is running.
                                 send_json(writer, &JsonRpcResponse {
                                     id: rpc.id,
                                     result: json!(true),
                                     error: None,
                                 }).await?;
+                                let suggested = parse_suggested_difficulty(&rpc.params);
+                                if let (Some(s), Some(v)) = (suggested, vardiff.as_mut()) {
+                                    if let Some(new_diff) = v.suggest(s, Instant::now()) {
+                                        current_share_difficulty = new_diff;
+                                        current_job = send_v1_retarget(
+                                            writer, new_diff, &current_template,
+                                            &extranonce1, extranonce2_size,
+                                            &coinbase_script, &mut job_counter,
+                                        ).await?;
+                                        info!(
+                                            %addr, difficulty = new_diff,
+                                            "Vardiff retarget (miner suggest_difficulty)"
+                                        );
+                                        continue;
+                                    }
+                                }
                                 debug!(%addr, "V1 mining.suggest_difficulty acknowledged");
                             }
                             other => {
@@ -1452,6 +1524,20 @@ async fn handle_v1_session(
                             params, header_index, mempool, best_height, best_hash,
                             next_template_id, 100, mining_config, datum_client,
                         ).await;
+
+                        // Keep vardiff's cap tracking the chain's difficulty
+                        // retargets; announce if the cap forced a change.
+                        if let Some(new_diff) = vardiff
+                            .as_mut()
+                            .and_then(|v| v.update_max(compact_target_to_difficulty(template.bits)))
+                        {
+                            current_share_difficulty = new_diff;
+                            send_json(writer, &JsonRpcNotification {
+                                id: None,
+                                method: "mining.set_difficulty".to_string(),
+                                params: json!([new_diff]),
+                            }).await?;
+                        }
 
                         current_job = build_v1_job(&template, &extranonce1, extranonce2_size, &coinbase_script);
                         current_job.job_id = format!("{job_counter:x}");
@@ -1486,7 +1572,12 @@ async fn handle_v1_session(
                         next_template_id, 100, mining_config, datum_client,
                     ).await;
 
-                    current_share_difficulty = effective_share_difficulty(bits_override, template.bits);
+                    // Vardiff state (when active) survives config changes —
+                    // the miner's hashrate didn't change with the coinbase.
+                    current_share_difficulty = match &vardiff {
+                        Some(v) => v.difficulty(),
+                        None => effective_share_difficulty(bits_override, template.bits),
+                    };
                     send_json(writer, &JsonRpcNotification {
                         id: None,
                         method: "mining.set_difficulty".to_string(),
@@ -1501,6 +1592,24 @@ async fn handle_v1_session(
 
                     send_v1_notify(writer, &current_job, true).await?;
                     info!(%addr, job_id = %current_job.job_id, "Pushed new V1 job (mining config changed)");
+                }
+            }
+
+            _ = vardiff_tick.tick() => {
+                if let Some(new_diff) = vardiff
+                    .as_mut()
+                    .and_then(|v| v.on_tick(Instant::now()))
+                {
+                    current_share_difficulty = new_diff;
+                    current_job = send_v1_retarget(
+                        writer, new_diff, &current_template,
+                        &extranonce1, extranonce2_size,
+                        &coinbase_script, &mut job_counter,
+                    ).await?;
+                    info!(
+                        %addr, worker = %worker_name, difficulty = new_diff,
+                        "Vardiff retarget (no shares at current difficulty)"
+                    );
                 }
             }
         }
@@ -1716,26 +1825,75 @@ async fn send_v1_notify(
     send_json(writer, &notify).await
 }
 
+/// Announce a changed share difficulty and immediately follow with a fresh
+/// job (clean) built from the current template, so the miner applies the new
+/// difficulty to work it can actually submit — `mining.set_difficulty` alone
+/// only takes effect on the next job. Returns the new current job; shares for
+/// the replaced job are rejected as stale, same as on any new-block job push.
+#[allow(clippy::too_many_arguments)]
+async fn send_v1_retarget(
+    writer: &mut OwnedWriteHalf,
+    difficulty: f64,
+    template: &TemplateData,
+    extranonce1: &[u8; 4],
+    extranonce2_size: usize,
+    coinbase_script: &[u8],
+    job_counter: &mut u64,
+) -> anyhow::Result<V1Job> {
+    send_json(
+        writer,
+        &JsonRpcNotification {
+            id: None,
+            method: "mining.set_difficulty".to_string(),
+            params: json!([difficulty]),
+        },
+    )
+    .await?;
+    let mut job = build_v1_job(template, extranonce1, extranonce2_size, coinbase_script);
+    job.job_id = format!("{job_counter:x}");
+    *job_counter += 1;
+    send_v1_notify(writer, &job, true).await?;
+    Ok(job)
+}
+
+/// Extract the difficulty from `mining.suggest_difficulty` params. Firmwares
+/// send `[1000]`, `[1000.5]`, or occasionally the number as a string.
+fn parse_suggested_difficulty(params: &Value) -> Option<f64> {
+    let v = params.as_array()?.first()?;
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        .filter(|d| d.is_finite() && *d > 0.0)
+}
+
 /// Encode prev_hash in Stratum V1's quirky byte order.
 ///
-/// Stratum V1 prevhash = the 32 internal (LE) bytes split into 8 four-byte
-/// chunks, with the CHUNKS iterated in reverse order while bytes within each
-/// chunk stay in their natural order.  This is equivalent to reading the
-/// display (BE) hash and reversing each 32-bit word in place.
+/// Stratum V1 prevhash = the 32 internal (LE) header bytes split into 8
+/// four-byte words, KEEPING word order but swapping the bytes within each
+/// word.  Equivalently: the display (BE) hash's 32-bit words in reverse
+/// order with bytes inside each word untouched.  Miners undo the per-word
+/// swap (`swap_endian_words` in ESP-Miner, cgminer, etc.) to recover the LE
+/// header bytes.  Sanity check: mainnet display hashes start with many zero
+/// bytes, so a canonical Stratum prevhash always ENDS with the zero run
+/// (e.g. `...0001a0f90000000000000000`), matching real pool notifies.
 ///
-/// The previous (wrong) implementation reversed bytes WITHIN each chunk while
-/// keeping chunk order — producing a completely different 32-byte string that
-/// causes ASIC firmware to build block headers with the wrong prev_block_hash,
-/// so hashes the firmware computes never match what the server reconstructs,
-/// and the firmware shows "BLOCK FOUND" internally but never submits (or
-/// submits shares our server rejects after header reconstruction).
+/// History: this function has been flipped twice.  The original (correct)
+/// per-word-swap version was "fixed" to reversed-chunk order after miners
+/// showed "BLOCK FOUND" without submitting — but that symptom was really the
+/// static 65536 share-difficulty throttle (shares just never cleared it).
+/// The flip went unnoticed on regtest because a wrongly reconstructed header
+/// still beats the trivial regtest target ~50% of the time (and the block the
+/// server then assembles uses the CORRECT prevhash, so it validates), while
+/// on mainnet it rejected every share as "Low difficulty share": the miner
+/// builds its header from this string, so the server's reconstruction from
+/// the true prev_hash never matched (2026-07-13, bitaxe, rejected shares all
+/// computed at ~4e-10 ≈ random hashes).
 fn template_prev_hash_stratum(hash: &BlockHash) -> String {
     let bytes = hash.to_byte_array();
     let mut result = String::with_capacity(64);
-    for chunk in bytes.chunks(4).rev() {
-        // chunks in reverse order …
-        for &b in chunk.iter() {
-            // … bytes within chunk stay forward
+    for chunk in bytes.chunks(4) {
+        // word order follows the internal (LE) header bytes …
+        for &b in chunk.iter().rev() {
+            // … but bytes within each 32-bit word are swapped
             result.push_str(&format!("{b:02x}"));
         }
     }
@@ -2255,10 +2413,12 @@ mod tests {
 
     #[test]
     fn test_template_prev_hash_stratum() {
-        // Genesis block hash (display/BE):
+        // Regtest genesis block hash (display/BE):
         //   0f9188f1 3cb7b2c7 1f2a335e 3a4fc328 bf5beb43 6012afca 590b1a11 466e2206
-        // Expected Stratum prevhash (each 32-bit word of display hash byte-swapped):
-        //   f188910f c7b2b73c 5e332a1f 28c34f3a 43eb5bbf caaf1260 111a0b59 06226e46
+        // Canonical Stratum prevhash = display-hash 32-bit words in REVERSE
+        // order, bytes within each word untouched (equivalently: LE header
+        // bytes with each 4-byte word byte-swapped in place):
+        //   466e2206 590b1a11 6012afca bf5beb43 3a4fc328 1f2a335e 3cb7b2c7 0f9188f1
         let hash_hex = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206";
         let hash_bytes: [u8; 32] = hex::decode(hash_hex).unwrap().try_into().unwrap();
         // bitcoin BlockHash is stored LE (reversed display)
@@ -2268,7 +2428,28 @@ mod tests {
         let result = template_prev_hash_stratum(&hash);
         assert_eq!(
             result,
-            "f188910fc7b2b73c5e332a1f28c34f3a43eb5bbfcaaf1260111a0b5906226e46"
+            "466e2206590b1a116012afcabf5beb433a4fc3281f2a335e3cb7b2c70f9188f1"
+        );
+    }
+
+    /// Real-world regression vector for the prevhash byte order (2026-07-13).
+    ///
+    /// Mainnet block 957869 (display):
+    ///   00000000000000000001a0f90d47e80ca66ea1d892fe1c3857f3e806fa250a64
+    /// Real pool notifies for this tip carry the zero run at the END of the
+    /// prevhash string. The buggy reversed-chunk encoding put it at the
+    /// FRONT (`0000000000000000f9a00100...`, observed in the bitaxe rx log),
+    /// making every mainnet share fail header reconstruction.
+    #[test]
+    fn test_template_prev_hash_stratum_mainnet_zero_run_at_end() {
+        let display = "00000000000000000001a0f90d47e80ca66ea1d892fe1c3857f3e806fa250a64";
+        let hash_bytes: [u8; 32] = hex::decode(display).unwrap().try_into().unwrap();
+        let mut le_bytes = hash_bytes;
+        le_bytes.reverse();
+        let hash = bitcoin::BlockHash::from_byte_array(le_bytes);
+        assert_eq!(
+            template_prev_hash_stratum(&hash),
+            "fa250a6457f3e80692fe1c38a66ea1d80d47e80c0001a0f90000000000000000"
         );
     }
 
