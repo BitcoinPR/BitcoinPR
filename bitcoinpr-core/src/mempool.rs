@@ -204,7 +204,9 @@ fn check_output_policy(tx: &Transaction, txid: Txid, params: &ConsensusParams) -
 fn check_relay_policy(tx: &Transaction, txid: Txid, params: &ConsensusParams) -> CoreResult<()> {
     check_output_policy(tx, txid, params)?;
     if params.reject_parasites {
-        if let Some(i) = script::tx_first_inscription_input(tx) {
+        // The bare-envelope (BIP-110 workaround) shape is sized against
+        // datacarriersize, mirroring Knots' DatacarrierBytes accounting.
+        if let Some(i) = script::tx_first_inscription_input(tx, params.max_datacarrier_size) {
             return Err(CoreError::InvalidTransaction(format!(
                 "parasite: input {i} of tx {txid} carries an inscription envelope (rejectparasites=1)"
             )));
@@ -1818,6 +1820,45 @@ mod tests {
             .expect_err("43 bytes must exceed a 42-byte datacarriersize")
             .to_string();
         assert!(err.contains("datacarriersize"), "got: {err}");
+    }
+
+    #[test]
+    fn test_bare_envelope_relay_policy() {
+        use bitcoin::ScriptBuf;
+
+        // Bare envelope (ord#4545 BIP-110 workaround: push run balanced by
+        // OP_2DROP/OP_DROP, no OP_IF) in a taproot script-path witness.
+        let mut leaf = vec![0x03];
+        leaf.extend_from_slice(b"ord");
+        leaf.extend_from_slice(&[0x4c, 200]); // OP_PUSHDATA1 200
+        leaf.extend_from_slice(&[0xab; 200]);
+        leaf.extend_from_slice(&[0x6d, 0x51]); // OP_2DROP OP_TRUE
+        let mut control = vec![0xc0];
+        control.extend_from_slice(&[0x02; 32]);
+        let mut w = bitcoin::Witness::new();
+        w.push([0u8; 64]);
+        w.push(&leaf);
+        w.push(&control);
+
+        let mut tx = tx_with_outputs(vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array(
+                [0x22; 20],
+            )),
+        }]);
+        tx.input[0].witness = w;
+        let txid = tx.compute_txid();
+
+        // Default params: rejected as parasite (207 counted bytes > 83).
+        let mut params = ConsensusParams::regtest();
+        let err = check_relay_policy(&tx, txid, &params)
+            .expect_err("bare envelope must be rejected by default")
+            .to_string();
+        assert!(err.contains("parasite"), "got: {err}");
+
+        // rejectparasites=0: relayed (plain data, not a token).
+        params.reject_parasites = false;
+        check_relay_policy(&tx, txid, &params).expect("clean with rejectparasites=0");
     }
 
     #[test]
