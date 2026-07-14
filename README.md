@@ -118,6 +118,14 @@ bitcoinpr-web/          # Embedded web explorer (Axum HTTP/WS)      [optional: -
 - **WebSocket** — real-time push notifications for new blocks, transactions, mining events; IBD-aware (suppresses rapid-fire block events during initial sync)
 - **Unified search** — look up blocks, transactions, and addresses from a single search bar
 
+<details>
+  <summary>Web Screenshots</summary>
+  <img src="docs/screenshots/dash.png" alt="dashboard page"/>
+  <img src="docs/screenshots/mempool.png" alt="mempool page"/>
+  <img src="docs/screenshots/mining.png" alt="mining page"/>
+  <img src="docs/screenshots/info.png" alt="info page"/>
+</details>
+
 ### Electrum Server
 
 - **Electrum protocol v1.4** — JSON-RPC over newline-delimited TCP (requires `--index`)
@@ -376,6 +384,8 @@ cargo test --workspace --all-features
 Unit tests cover consensus params, block validation, script interpretation (incl. 5-byte `CScriptNum` for lock-time opcodes), buried-deployment activation (`deployment_active`, `csv_height`), BIP 110 RDTS (all seven rules + the P2A exemption, and the signaling state machine: full lifecycle DEFINED→ACTIVE→EXPIRED, mandatory-floor lock-in, and reorg-safety across forks), storage roundtrips, serialization, mempool operations, address management, signature caching, compact block filters, BIP 37 bloom filters (MurmurHash3 verified against Core's `bloom_tests.cpp` vectors), V2 transport, versionbits, fee estimation, mining templates, coinbase-tag injection, `MiningConfig` save/load + validation, `DatumMessage` serialization, the Datum client (solo-idle, share-queue, coinbase-output decoding), bech32m (BIP 350) taproot address vectors and scripthash derivation, UTXO flush-height recovery, undo data v2 rollback, block pruning (ceiling bounds, file/undo deletion, file-numbering survival across reopen), block store verification, tx index height tracking, and cross-block prevout resolution (including the cold-cache disk path through the tx index and partial block decode). Property tests (proptest) pin the hand-rolled u256 chainwork arithmetic against a num-bigint oracle and the shared merkle module against rust-bitcoin's implementation.
 
 The interop suite verifies end-to-end block generation, P2P propagation, mempool relay, Stratum mining, and consensus agreement across a 6-node Docker cluster that deliberately mixes implementations — 2× BitcoinPR alongside Bitcoin Core 31.0, Bitcoin Knots, btcd (Go), and libbitcoin — so cross-implementation compatibility is exercised on every run (a live bitaxe ASIC can also mine the cluster's Stratum port). btcd participates as a sync/validation node (it has no built-in wallet) and is cross-checked for height and tip agreement.
+
+<img src="docs/screenshots/interop-regtest-sparrow.png" alt="interop regtest cluster"/>
 
 ## Dependencies
 
