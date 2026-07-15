@@ -95,4 +95,12 @@ pub struct WebState {
     /// endpoints such as POST /api/mining/config. `None` disables those
     /// endpoints entirely (read-only explorer).
     pub web_admin_token: Option<String>,
+    /// Chain-split monitor (rival-branch tracking + capitulation arming);
+    /// drives the Split page. `None` in minimal embeddings.
+    pub split_monitor: Option<Arc<bitcoinpr_core::SplitMonitor>>,
+    /// Node shutdown channel — used by POST /api/split/capitulate to stop
+    /// the node gracefully after persisting the abandon flag.
+    pub shutdown_tx: Option<tokio::sync::mpsc::Sender<()>>,
+    /// Node shutdown flag, set alongside `shutdown_tx`.
+    pub shutting_down: Option<Arc<AtomicBool>>,
 }

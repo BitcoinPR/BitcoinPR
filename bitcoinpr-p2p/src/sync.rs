@@ -70,7 +70,31 @@ pub struct HeaderSync {
     /// removed when a peer's headers connect or it disconnects, so the map
     /// only holds currently-misbehaving peers.
     unconnecting: std::collections::HashMap<PeerId, u32>,
+    /// Memo of branch-tip hash → "branch contains a marked-invalid block".
+    /// Purely an optimization over the cold `first_invalid_ancestor` walk;
+    /// correctness never depends on it. Cleared wholesale when it grows past
+    /// `TAINT_MEMO_MAX` so header spam can't inflate it, and whenever the
+    /// marker set's generation changes (see `refresh_taint_memo`).
+    branch_tainted: std::collections::HashMap<BlockHash, bool>,
+    /// Invalid-marker generation the memo was built against.
+    taint_memo_generation: u64,
+    /// Chain-split monitor notified when a tainted branch grows.
+    split_monitor: Option<Arc<bitcoinpr_core::SplitMonitor>>,
+    /// BIP-110 deployment + signaling checker (mainnet signaling mode only).
+    /// Enables header-level classification of mandatory-signaling-window
+    /// violations, so a non-signaling rival branch is excluded from fork
+    /// choice without ever downloading its block bodies.
+    bip110: Option<(
+        bitcoinpr_core::Bip110Deployment,
+        Arc<bitcoinpr_core::Bip110Checker>,
+    )>,
 }
+
+/// Cap on the `branch_tainted` memo before it is cleared.
+const TAINT_MEMO_MAX: usize = 4096;
+
+/// Bound on the prev-link walk when checking a branch for invalid ancestors.
+const TAINT_WALK_MAX: u32 = 10_000;
 
 impl HeaderSync {
     pub fn new(
@@ -93,7 +117,81 @@ impl HeaderSync {
             best_chain_work,
             synced: false,
             unconnecting: std::collections::HashMap::new(),
+            branch_tainted: std::collections::HashMap::new(),
+            taint_memo_generation: 0,
+            split_monitor: None,
+            bip110: None,
         }
+    }
+
+    /// Drop the taint memo if invalid markers changed outside this struct
+    /// (`invalidateblock`/`reconsiderblock` RPCs, capitulation). Called at
+    /// the top of every `process_headers`.
+    fn refresh_taint_memo(&mut self) {
+        let gen = self.header_index.invalid_generation();
+        if gen != self.taint_memo_generation {
+            self.branch_tainted.clear();
+            self.taint_memo_generation = gen;
+        }
+    }
+
+    /// Attach the chain-split monitor (notified when tainted branches grow).
+    pub fn set_split_monitor(&mut self, monitor: Arc<bitcoinpr_core::SplitMonitor>) {
+        self.split_monitor = Some(monitor);
+    }
+
+    /// Enable header-level BIP-110 mandatory-signaling classification
+    /// (signaling deployments only — the fixed-mode override has no
+    /// signaling requirement).
+    pub fn set_bip110_signaling(
+        &mut self,
+        deployment: bitcoinpr_core::Bip110Deployment,
+        checker: Arc<bitcoinpr_core::Bip110Checker>,
+    ) {
+        self.bip110 = Some((deployment, checker));
+    }
+
+    /// Whether the branch ending at `tip` contains a block durably marked
+    /// consensus-invalid. Consults the memo first; on a miss, walks prev
+    /// links via `first_invalid_ancestor` (cheap: returns immediately when
+    /// no invalid markers exist at all). `validated_floor` is the connected
+    /// block-chain height, below which a canonical-index match proves the
+    /// walk has left the fork. Storage errors are logged and treated as
+    /// clean — if RocksDB is failing, header processing is failing anyway.
+    fn branch_is_tainted(&mut self, tip: &BlockHash, validated_floor: u32) -> bool {
+        if let Some(&t) = self.branch_tainted.get(tip) {
+            return t;
+        }
+        let tainted = if self.header_index.is_invalid(tip) {
+            true
+        } else {
+            match self
+                .header_index
+                .first_invalid_ancestor(tip, validated_floor, TAINT_WALK_MAX)
+            {
+                Ok(found) => found.is_some(),
+                Err(e) => {
+                    warn!(%tip, error = %e, "Invalid-ancestor walk failed; treating branch as clean");
+                    false
+                }
+            }
+        };
+        self.note_branch_taint(*tip, tainted);
+        tainted
+    }
+
+    /// Record a branch tip's taint state in the memo (bounded).
+    fn note_branch_taint(&mut self, tip: BlockHash, tainted: bool) {
+        if self.branch_tainted.len() >= TAINT_MEMO_MAX {
+            self.branch_tainted.clear();
+        }
+        self.branch_tainted.insert(tip, tainted);
+    }
+
+    /// Drop all taint memo entries — call after invalid markers change
+    /// outside the header path (e.g. capitulation cleared them).
+    pub fn clear_taint_memo(&mut self) {
+        self.branch_tainted.clear();
     }
 
     /// Record one more unconnecting-header message from `peer_id` and return
@@ -191,6 +289,8 @@ impl HeaderSync {
             return Ok(0);
         }
 
+        self.refresh_taint_memo();
+
         let mut accepted = 0u32;
         let mut batch: Vec<(BlockHash, StoredHeader)> = Vec::new();
         // Hash → StoredHeader view of `batch` so the nBits check can resolve
@@ -199,6 +299,10 @@ impl HeaderSync {
             std::collections::HashMap::new();
         let mut prev_hash = self.best_hash;
         let mut height = self.best_height;
+        // Tip of the last re-announced ALREADY-STORED segment the walk
+        // advanced over (see the stored-header branch below): fork choice is
+        // re-evaluated for it after the loop.
+        let mut stored_walk_tip: Option<(BlockHash, u32, [u8; 32])> = None;
 
         for header in headers {
             // Fast-skip headers we already have stored at or below our tip.
@@ -223,36 +327,24 @@ impl HeaderSync {
             if header.prev_blockhash != prev_hash {
                 // Check if we already have this header
                 if let Ok(Some(stored)) = self.header_index.get_header(&hash) {
-                    // We already have this header by hash — but the height→hash
-                    // index can be missing or stale for its height (a prior crash
-                    // or reorg can leave CF_HEADERS populated while CF_HEIGHT_INDEX
-                    // has a gap). That gap strands block download: the re-request
-                    // loop walks `for h in start..=tip { get_hash_at_height(h) }`
-                    // and silently skips any height whose index entry is absent,
-                    // so the missing block is never requested and the node sticks
-                    // one block behind forever. Repair the index entry here, and
-                    // advance the walk from this known header so the next header
-                    // chains cleanly instead of taking the fork path.
+                    // We already have this header by hash. Advance the walk
+                    // from it so subsequent headers chain cleanly — but do
+                    // NOT write its height-index entry here: this header may
+                    // sit on a branch that never won (or lost) fork choice,
+                    // and pre-writing its entry pollutes the index above the
+                    // validated tip (misleading the split monitor, and
+                    // poisoning the headers WE serve — a peer receiving the
+                    // broken sequence discards it and stalls syncing from
+                    // us). Instead, remember the segment's tip: after the
+                    // loop, fork choice is re-evaluated for it, which both
+                    // repairs legitimate index gaps (crash recovery) and
+                    // adopts a stored-but-never-adopted heavier branch (e.g.
+                    // the majority chain re-announced after capitulation)
+                    // without waiting for its next new block.
                     let known_hash = header.block_hash();
-                    let known_height = stored.height;
-                    if self
-                        .header_index
-                        .get_hash_at_height(known_height)
-                        .ok()
-                        .flatten()
-                        != Some(known_hash)
-                    {
-                        if let Err(e) = self
-                            .header_index
-                            .insert_headers_batch(&[(known_hash, stored.clone())])
-                        {
-                            warn!(height = known_height, error = %e, "Failed to repair height→hash index");
-                        } else {
-                            debug!(height = known_height, hash = %known_hash, "Repaired missing height→hash index entry");
-                        }
-                    }
                     prev_hash = known_hash;
-                    height = known_height;
+                    height = stored.height;
+                    stored_walk_tip = Some((known_hash, stored.height, stored.chain_work));
                     continue;
                 }
                 // Check if it connects to a known header (fork)
@@ -407,6 +499,40 @@ impl HeaderSync {
             };
             let chain_work = bitcoinpr_core::add_chain_work(&prev_work, &block_work);
 
+            // BIP-110 header-level mandatory-signaling classification: a
+            // non-signaling header inside the mandatory window while the
+            // deployment is STARTED can never connect (block validation
+            // enforces the same rule), so mark it invalid NOW — fork choice
+            // then ignores its whole branch without downloading any block
+            // bodies. Opportunistic: if the deployment state can't be
+            // resolved yet (ancestors mid-batch), connect-time enforcement
+            // still catches it.
+            if let Some((dep, checker)) = &self.bip110 {
+                let (lo, hi) = dep.mandatory_window;
+                if height >= lo
+                    && height <= hi
+                    && !dep.signals(header.version.to_consensus() as u32)
+                    && !self.header_index.is_invalid(&hash)
+                {
+                    let act =
+                        checker.activation_for(&self.header_index, &header.prev_blockhash, height);
+                    if act.state == bitcoinpr_core::ThresholdState::Started {
+                        warn!(
+                            height,
+                            hash = %hash,
+                            "Header violates BIP-110 mandatory signaling — marking invalid at header level"
+                        );
+                        if let Err(e) = self.header_index.mark_invalid(
+                            &hash,
+                            height,
+                            bitcoinpr_storage::INVALID_REASON_SIGNALING,
+                        ) {
+                            warn!(error = %e, "Failed to persist signaling-violation marker");
+                        }
+                    }
+                }
+            }
+
             let stored = StoredHeader {
                 header: *header,
                 height,
@@ -443,13 +569,62 @@ impl HeaderSync {
                 .map(|h| h.chain_work)
                 .unwrap_or([0u8; 32]);
 
-            if new_chain_work >= current_best_work {
+            // Anti-wedge: a branch containing a durably marked-invalid block
+            // (e.g. a BIP-110-violating rival chain) must never win fork
+            // choice regardless of work — adopting it triggers a reorg whose
+            // connect phase is guaranteed to fail after our valid blocks were
+            // already disconnected. Checked BEFORE the >= tie-break so an
+            // equal-work tainted tip can't displace ours. The batch parent
+            // carries any inherited taint; batch members are checked directly.
+            let batch_parent = batch
+                .first()
+                .expect("batch is non-empty, checked above")
+                .1
+                .header
+                .prev_blockhash;
+            let tainted = self.branch_is_tainted(&batch_parent, block_height)
+                || batch.iter().any(|(h, _)| self.header_index.is_invalid(h));
+            self.note_branch_taint(prev_hash, tainted);
+
+            if tainted && new_chain_work >= current_best_work {
+                info!(
+                    tip = %prev_hash,
+                    height,
+                    "Ignoring heavier chain with invalid ancestor (fork choice unchanged)"
+                );
+            }
+
+            // Feed the split monitor: a tainted branch just grew (or was
+            // first seen). `batch_parent` lets the monitor replace the tip
+            // it was tracking for this branch.
+            if tainted {
+                if let Some(monitor) = &self.split_monitor {
+                    monitor.on_tainted_tip(
+                        bitcoinpr_core::TipInfo {
+                            hash: prev_hash,
+                            height,
+                            work: new_chain_work,
+                        },
+                        Some(batch_parent),
+                    );
+                }
+            }
+
+            if !tainted && new_chain_work >= current_best_work {
                 // This chain has the most work — update the height→hash index.
                 self.header_index
                     .update_height_index_batch(&batch)
                     .map_err(|e| {
                         HeaderSyncError::Storage(format!("failed to update height index: {e}"))
                     })?;
+                // The batch may extend an already-stored segment whose index
+                // entries were never written (fork headers stored hash-only,
+                // now winning): repoint the index down the whole branch until
+                // it merges with the canonical mapping, so block download
+                // never walks into a hole.
+                if let Err(e) = self.header_index.restore_branch_height_index(&prev_hash) {
+                    warn!(tip = %prev_hash, error = %e, "Failed to backfill branch height index on adoption");
+                }
                 if height != self.best_height || prev_hash != self.best_hash {
                     info!(
                         old_height = self.best_height,
@@ -490,6 +665,50 @@ impl HeaderSync {
                     hash = %self.best_hash,
                     "Headers progress"
                 );
+            }
+        }
+
+        // Fork-choice re-evaluation for a re-announced ALREADY-STORED branch
+        // (nothing new was accepted from it, so the batch block above never
+        // saw it). A stored branch that never won fork choice — or whose
+        // invalid markers were just cleared for reconsideration — is adopted
+        // here once it strictly out-works our tip and has no invalid
+        // ancestors. This is what converges the node onto the majority chain
+        // right after capitulation/reconsiderblock from the re-announcement
+        // alone, and it also heals legitimate index gaps after a crash.
+        // Strictly greater work: a same-work re-announcement must not
+        // flip-flop the tip.
+        if let Some((tip_hash, tip_height, tip_work)) = stored_walk_tip {
+            if tip_hash != self.best_hash
+                && tip_work > self.best_chain_work
+                && !is_catching_up(block_height, self.best_height)
+                && !self.branch_is_tainted(&tip_hash, block_height)
+            {
+                match self.header_index.restore_branch_height_index(&tip_hash) {
+                    Ok((_, fixed)) => {
+                        if let Err(e) = self
+                            .header_index
+                            .reset_fork_header_tip(tip_height, &tip_hash)
+                        {
+                            warn!(tip = %tip_hash, error = %e, "Failed to reset header tip to re-announced branch");
+                        } else {
+                            info!(
+                                old_height = self.best_height,
+                                new_height = tip_height,
+                                old_tip = %self.best_hash,
+                                new_tip = %tip_hash,
+                                index_entries_fixed = fixed,
+                                "Adopting re-announced stored branch with more work"
+                            );
+                            self.best_hash = tip_hash;
+                            self.best_height = tip_height;
+                            self.best_chain_work = tip_work;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(tip = %tip_hash, error = %e, "Cannot backfill re-announced branch index — not adopting");
+                    }
+                }
             }
         }
 
@@ -1435,6 +1654,161 @@ mod header_sync_tests {
         let accepted = sync.process_headers(&[candidate], 0).unwrap();
         assert_eq!(accepted, 1);
         assert_eq!(sync.best_height, interval);
+    }
+
+    /// A heavier branch containing a marked-invalid block must be stored
+    /// (hash-only, for the split monitor) but never win fork choice —
+    /// including via the memo when later batches extend it — and must become
+    /// adoptable again once the markers are cleared (capitulation).
+    #[test]
+    fn tainted_branch_never_wins_fork_choice() {
+        let params = ConsensusParams::regtest();
+        let (_dir, index) = open_index();
+        let mut sync = sync_at_genesis(&params, &index);
+        let genesis = params.genesis_block.header;
+        let genesis_hash = genesis.block_hash();
+
+        // Our chain A: two blocks on genesis.
+        let a1 = mine_header(genesis_hash, genesis.bits, genesis.time + 600);
+        let a2 = mine_header(a1.block_hash(), genesis.bits, genesis.time + 1200);
+        assert_eq!(sync.process_headers(&[a1, a2], 0).unwrap(), 2);
+        assert_eq!(sync.best_height, 2);
+        assert_eq!(sync.best_hash, a2.block_hash());
+
+        // Rival chain B: three blocks on genesis (more work), with b1 marked
+        // consensus-invalid before its headers arrive.
+        let b1 = mine_header(genesis_hash, genesis.bits, genesis.time + 601);
+        let b2 = mine_header(b1.block_hash(), genesis.bits, genesis.time + 1201);
+        let b3 = mine_header(b2.block_hash(), genesis.bits, genesis.time + 1801);
+        index
+            .mark_invalid(
+                &b1.block_hash(),
+                1,
+                bitcoinpr_storage::INVALID_REASON_BIP110,
+            )
+            .unwrap();
+
+        assert_eq!(sync.process_headers(&[b1, b2, b3], 2).unwrap(), 3);
+        // Stored for observability…
+        assert!(index.get_header(&b3.block_hash()).unwrap().is_some());
+        // …but fork choice unchanged: tip and height index stay on A.
+        assert_eq!(sync.best_height, 2);
+        assert_eq!(sync.best_hash, a2.block_hash());
+        assert_eq!(
+            index.get_hash_at_height(1).unwrap(),
+            Some(a1.block_hash()),
+            "height index must not be clobbered by the tainted branch"
+        );
+        assert!(index.get_hash_at_height(3).unwrap().is_none());
+
+        // Memo inheritance: a later batch extending the tainted tip is still
+        // rejected without any marker on its own headers.
+        let b4 = mine_header(b3.block_hash(), genesis.bits, genesis.time + 2401);
+        assert_eq!(sync.process_headers(&[b4], 2).unwrap(), 1);
+        assert_eq!(sync.best_height, 2);
+        assert_eq!(sync.best_hash, a2.block_hash());
+
+        // Re-announcing the stored tainted branch must not pollute the
+        // height index (the old repair path pre-wrote entries above the
+        // validated tip) and must not move the tip.
+        assert_eq!(sync.process_headers(&[b4], 2).unwrap(), 0);
+        assert!(index.get_hash_at_height(3).unwrap().is_none());
+        assert!(index.get_hash_at_height(4).unwrap().is_none());
+        assert_eq!(sync.best_hash, a2.block_hash());
+
+        // Reconsideration: clear the markers EXTERNALLY (no manual memo
+        // clear — the marker-generation counter invalidates the taint memo)
+        // and re-announce the stored branch. Fork choice re-evaluates the
+        // stored segment and adopts it with no new block needed, backfilling
+        // the whole branch's height index.
+        index.clear_all_invalid().unwrap();
+        assert_eq!(sync.process_headers(&[b4], 2).unwrap(), 0);
+        assert_eq!(sync.best_height, 4);
+        assert_eq!(sync.best_hash, b4.block_hash());
+        for (h, hdr) in [(1u32, &b1), (2, &b2), (3, &b3), (4, &b4)] {
+            assert_eq!(
+                index.get_hash_at_height(h).unwrap(),
+                Some(hdr.block_hash()),
+                "height {h} must point at the adopted branch"
+            );
+        }
+        assert_eq!(index.get_header_tip().unwrap(), Some(b4.block_hash()));
+    }
+
+    /// Grind a header with an explicit version (for BIP-110 signaling tests).
+    fn mine_header_v(prev: BlockHash, bits: CompactTarget, time: u32, version: i32) -> Header {
+        let mut header = Header {
+            version: Version::from_consensus(version),
+            prev_blockhash: prev,
+            merkle_root: TxMerkleNode::all_zeros(),
+            time,
+            bits,
+            nonce: 0,
+        };
+        while header.validate_pow(header.target()).is_err() {
+            header.nonce += 1;
+        }
+        header
+    }
+
+    /// Signaling mode: a non-signaling header inside the mandatory window
+    /// while the deployment is STARTED is marked invalid at header level and
+    /// its branch never wins fork choice; a signaling header at the same
+    /// height is accepted and adopted.
+    #[test]
+    fn mandatory_window_violation_marked_at_header_level() {
+        use bitcoinpr_core::{Bip110Checker, Bip110Deployment};
+
+        let params = ConsensusParams::regtest();
+        let (_dir, index) = open_index();
+        let mut sync = sync_at_genesis(&params, &index);
+        let genesis = params.genesis_block.header;
+
+        // Tiny deployment: period 4, STARTED from genesis (start_time 0),
+        // mandatory window at heights 4..=7, no early lock-in.
+        let dep = Bip110Deployment {
+            period: 4,
+            bit: 4,
+            start_time: 0,
+            threshold: 4,
+            lock_in_floor_height: 1_000,
+            mandatory_window: (4, 7),
+            active_duration: 100,
+        };
+        let checker = Arc::new(Bip110Checker::new(dep.clone()));
+        sync.set_bip110_signaling(dep, checker);
+
+        // Build heights 1-3 (pre-window; version irrelevant).
+        let mut prev = genesis;
+        let mut prev_hash = genesis.block_hash();
+        for i in 1..=3u32 {
+            let h = mine_header(prev_hash, genesis.bits, genesis.time + i * 600);
+            assert_eq!(sync.process_headers(&[h], 0).unwrap(), 1);
+            prev = h;
+            prev_hash = h.block_hash();
+        }
+        assert_eq!(sync.best_height, 3);
+        let _ = prev;
+
+        // Height 4, inside the window, NOT signaling (top bits without bit 4):
+        // stored but marked invalid; fork choice unchanged.
+        let bad = mine_header_v(prev_hash, genesis.bits, genesis.time + 4 * 600, 0x2000_0000);
+        assert_eq!(sync.process_headers(&[bad], 3).unwrap(), 1);
+        assert!(index.is_invalid(&bad.block_hash()));
+        assert_eq!(sync.best_height, 3, "non-signaling branch must not win");
+        assert!(index.get_hash_at_height(4).unwrap().is_none());
+
+        // Height 4 signaling (top bits + bit 4): accepted and adopted.
+        let good = mine_header_v(
+            prev_hash,
+            genesis.bits,
+            genesis.time + 4 * 600 + 1,
+            0x2000_0010,
+        );
+        assert_eq!(sync.process_headers(&[good], 3).unwrap(), 1);
+        assert!(!index.is_invalid(&good.block_hash()));
+        assert_eq!(sync.best_height, 4);
+        assert_eq!(sync.best_hash, good.block_hash());
     }
 }
 

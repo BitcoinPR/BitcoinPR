@@ -353,6 +353,27 @@ async fn main() -> anyhow::Result<()> {
     let header_index = Arc::new(HeaderIndex::open(&net_dir.join("headers"))?);
     let utxo_set = Arc::new(UtxoSet::open(&net_dir.join("utxo"), dbcache_mb)?);
 
+    // "Abandon minority chain": if the operator capitulated on BIP-110, the
+    // persisted flag OVERRIDES --bip110height/conf and the network's default
+    // deployment (the container/service command line is unchanged after the
+    // restart, so the flag must win). With enforcement off and the invalid
+    // markers cleared, the next headers from majority peers re-adopt the
+    // heavier rival branch and the normal reorg machinery converges on the
+    // most-work chain.
+    let bip110_abandoned_at = header_index.get_bip110_abandoned()?;
+    if bip110_abandoned_at.is_some() {
+        warn!(
+            "BIP-110 ABANDONED by operator — RDTS enforcement disabled, \
+             clearing invalid-block markers and following accumulated proof of work"
+        );
+        params.bip110_activation_height = None;
+        params.bip110_deployment = None;
+        header_index.clear_all_invalid()?;
+        // The tracked rival branch is about to become OUR chain — drop the
+        // persisted split record along with the markers.
+        header_index.clear_split_rival_tips()?;
+    }
+
     // Start background block writer thread for async flat-file writes
     block_store.start_background_writer();
 
@@ -665,6 +686,15 @@ async fn main() -> anyhow::Result<()> {
     // --- Event Bus ---
     let event_bus = Arc::new(EventBus::new(1024));
 
+    // --- Chain-split monitor ---
+    // Tracks rival branches containing consensus-invalid blocks (e.g. a
+    // BIP-110-violating majority chain) and arms the "abandon minority
+    // chain" action when their lead crosses the threshold.
+    let split_monitor = Arc::new(bitcoinpr_core::SplitMonitor::new(
+        header_index.clone(),
+        event_bus.sender(),
+    ));
+
     // Resolve effective RPC credentials and bind address (CLI overrides conf).
     let rpc_user = if cli.rpcuser != "bitcoinpr" {
         &cli.rpcuser
@@ -862,6 +892,7 @@ async fn main() -> anyhow::Result<()> {
         scripthash_indexed_height: scripthash_indexed_height.clone(),
         prune_target_bytes,
         net_status,
+        split_monitor: Some(split_monitor.clone()),
     });
 
     let rpc_server = RpcServer::new(rpc_state);
@@ -972,12 +1003,22 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let header_sync = HeaderSync::new(
+    let mut header_sync = HeaderSync::new(
         params.clone(),
         header_index.clone(),
         header_tip_height,
         header_tip_hash,
     );
+    header_sync.set_split_monitor(split_monitor.clone());
+    // Signaling mode (mainnet): classify mandatory-signaling violations at
+    // header level and give the split monitor the deployment parameters for
+    // rival-branch signaling stats.
+    if let Some(dep) = params.bip110_deployment.clone() {
+        split_monitor.set_bip110_deployment(dep.clone());
+        if let Some(checker) = chain_state.lock().await.bip110_checker() {
+            header_sync.set_bip110_signaling(dep, checker);
+        }
+    }
 
     // Create block sync. Start with downloads paused if the header chain is
     // still below the network's minimum chain work (fresh IBD) — the event
@@ -1255,6 +1296,9 @@ async fn main() -> anyhow::Result<()> {
                 ]
             },
             web_admin_token: web_admin_token.clone(),
+            split_monitor: Some(split_monitor.clone()),
+            shutdown_tx: Some(shutdown_tx.clone()),
+            shutting_down: Some(shutting_down.clone()),
         };
         let web_peers = web_state.peers.clone();
         let web_server = bitcoinpr_web::WebServer::new(web_state, webport);
@@ -1345,6 +1389,7 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "web")]
         web_peers,
         prune_target_bytes,
+        split_monitor: Some(split_monitor),
     };
     node.run().await
 }

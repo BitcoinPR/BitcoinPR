@@ -2449,3 +2449,137 @@ a.footer-brand:hover strong {
 .collapse-section[open] .collapse-arrow {
     transform: rotate(90deg);
 }
+
+/* ============================================================
+   Chain Split Monitor page: rival-chain race view and the
+   "abandon minority chain" action.
+   ============================================================ */
+
+.card-value.red { color: var(--red); }
+
+.btn-danger {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 11px 18px;
+    margin-top: 12px;
+    font-family: var(--font-pixel);
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    color: var(--bg-0);
+    background: var(--red);
+    border: 1px solid var(--red);
+    box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.6);
+    cursor: pointer;
+    transition: filter var(--transition);
+}
+
+.btn-danger:hover:not(:disabled) {
+    filter: brightness(1.2);
+}
+
+.btn-danger:active:not(:disabled) {
+    transform: translate(2px, 2px);
+    box-shadow: 1px 1px 0 rgba(0, 0, 0, 0.6);
+}
+
+.btn-danger:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Fork Timechain on the Split page: shared segment, connector, two lanes. */
+
+.fork-strip {
+    align-items: center;
+}
+
+.fork-shared {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    flex: 0 0 auto;
+}
+
+.fork-connector {
+    flex: 0 0 auto;
+    width: 26px;
+    align-self: stretch;
+    background:
+        linear-gradient(to bottom, transparent calc(25% - 1px), var(--border-1) calc(25% - 1px), var(--border-1) calc(25% + 1px), transparent calc(25% + 1px)),
+        linear-gradient(to bottom, transparent calc(75% - 1px), var(--border-1) calc(75% - 1px), var(--border-1) calc(75% + 1px), transparent calc(75% + 1px)),
+        linear-gradient(to right, transparent calc(50% - 1px), var(--border-1) calc(50% - 1px), var(--border-1) calc(50% + 1px), transparent calc(50% + 1px));
+    background-repeat: no-repeat;
+    background-size: 50% 100%, 50% 100%, 100% 52%;
+    background-position: right top, right top, left 24%;
+}
+
+.fork-branches {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    flex: 0 0 auto;
+}
+
+.fork-lane {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+}
+
+.fork-lane-label {
+    flex: 0 0 auto;
+    writing-mode: vertical-rl;
+    transform: rotate(180deg);
+    font-family: var(--font-pixel);
+    font-size: 0.55rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    text-align: center;
+}
+
+.fork-lane-label.ours-label { color: var(--green); }
+.fork-lane-label.rival-label { color: var(--red); }
+
+/* Fork-point cube: the last block both chains agree on. */
+.chain-block.fork-point {
+    border-color: var(--amber);
+    box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.6), 0 0 8px rgba(255, 179, 71, 0.35);
+}
+
+/* Rival-lane cubes: header-only, inert, red-bordered. */
+.chain-block.rival {
+    border-color: var(--red);
+    cursor: default;
+}
+
+.chain-block.rival .chain-block-height { color: var(--red); }
+
+.chain-block.rival:hover {
+    transform: none;
+    box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.6);
+    border-color: var(--red);
+}
+
+.chain-block.rival.tip {
+    box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.6), 0 0 8px rgba(255, 92, 92, 0.4);
+}
+
+.chain-block.rival.invalid {
+    background: repeating-linear-gradient(
+        45deg,
+        rgba(255, 92, 92, 0.08) 0 6px,
+        transparent 6px 12px
+    );
+}
+
+/* Gap marker between the first post-fork cube and the newest cubes. */
+.chain-block.ghost.gap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-pixel);
+    color: var(--text-lo);
+    width: 48px;
+}

@@ -77,7 +77,7 @@ bitcoinpr-web/          # Embedded web explorer (Axum HTTP/WS)      [optional: -
 - BIP 66 — strict DER signature encoding
 - BIP 68 — relative lock-time via sequence numbers
 - BIP 90 — buried soft-fork deployments (per-network activation heights, incl. dedicated `csv_height`)
-- BIP 110 — Reduced Data Temporary Softfork (RDTS): seven data-restriction rules (scriptPubKey ≤34 / OP_RETURN ≤83, push & witness items ≤256, undefined witness/Tapleaf versions, Taproot annex, control blocks ≤257, OP_SUCCESS, OP_IF/OP_NOTIF) with UTXO grandfathering by creation height. Signaling-driven activation via a reorg-safe BIP-8 state machine (mandatory-signaling window, expiry); `--bip110height` fixed-mode override for testing
+- BIP 110 — Reduced Data Temporary Softfork (RDTS): seven data-restriction rules (scriptPubKey ≤34 / OP_RETURN ≤83, push & witness items ≤256, undefined witness/Tapleaf versions, Taproot annex, control blocks ≤257, OP_SUCCESS, OP_IF/OP_NOTIF) with UTXO grandfathering by creation height. Signaling-driven activation via a reorg-safe BIP-8 state machine (mandatory-signaling window, expiry); `--bip110height` fixed-mode override for testing. Includes a **chain-split monitor** — if the majority chain violates BIP-110, the node holds its chain (durable invalid-block markers + taint-aware fork choice; non-signaling mandatory-window headers are classified without downloading blocks), tracks both chains (`getchainsplitinfo`, web Split page), and offers an **abandon minority chain** action once the rival leads by 6+ blocks and equivalent work: a persisted flag + restart disables RDTS enforcement and the node rejoins the most-work chain
 - BIP 111 — `NODE_BLOOM` service flag (paired with BIP 37, opt-in)
 - BIP 112 — CHECKSEQUENCEVERIFY (full semantics in legacy and tapscript; 5-byte `CScriptNum` for lock-time values)
 - BIP 113 — median-time-past for lock-time
@@ -98,7 +98,7 @@ bitcoinpr-web/          # Embedded web explorer (Axum HTTP/WS)      [optional: -
 
 ### JSON-RPC
 
-- **26 Bitcoin Core-compatible methods** — works with `bitcoin-cli`; `getpeerinfo` reports live per-peer `synced_headers`/`synced_blocks` tracked from headers and block-inv announcements
+- **30 Bitcoin Core-compatible methods** — works with `bitcoin-cli`; `getpeerinfo` reports live per-peer `synced_headers`/`synced_blocks` tracked from headers and block-inv announcements; `invalidateblock`/`reconsiderblock` for operator-driven fork management; plus `getchainsplitinfo` / `abandonbip110` for the BIP-110 chain-split monitor
 - **HTTP Basic authentication** — `rpcuser`/`rpcpassword` enforced at the HTTP layer (constant-time compare) for *every* method before dispatch; unauthenticated requests get `401`. The node refuses to start if RPC is bound to a non-loopback address while still using the default password
 - **Batch request support** — up to 100 requests per batch
 - **Health check endpoint** — HTTP health on RPC port + 100 with status, height, peers, uptime
@@ -115,7 +115,8 @@ bitcoinpr-web/          # Embedded web explorer (Axum HTTP/WS)      [optional: -
 - **Expandable transaction flow diagram** — Sankey visualization of inputs/outputs with hover highlighting, now interactive: a `+` on any input expands the graph backward into the previous transaction (unlimited, follow the chain), and a `+` on an output expands forward into its spender — both unconfirmed (mempool) and confirmed spenders, the latter resolved via the cross-block scripthash index so you can follow the money forward across blocks. Each output carries a spend badge (UTXO / spent / pending) resolved from the mempool, UTXO set, and scripthash index
 - **Mempool visualization** — fee-rate histogram, paginated transaction list, and a **sat/vByte-over-time** stepped chart with 15m/30m/1h/2h timeframe selection, fed by a periodic in-memory sampler
 - **Mining dashboard** — real-time hashrate, shares, workers, blocks found (requires `--mining`)
-- **WebSocket** — real-time push notifications for new blocks, transactions, mining events; IBD-aware (suppresses rapid-fire block events during initial sync)
+- **Chain Split page** — BIP-110 split monitor: two-chain race view (fork point, both tips, block/work deficit, first invalid rival block, signaling stats) with an **Abandon minority chain** action (typed confirmation + `--webadmintoken`) once the rival chain leads by the threshold. The tab only appears while the split is live (a tracked rival at or above our chain work); once the rival is out-worked, resolved, or abandoned it disappears again (the page stays reachable at `#/split`)
+- **WebSocket** — real-time push notifications for new blocks, transactions, mining events, and chain-split state changes; IBD-aware (suppresses rapid-fire block events during initial sync)
 - **Unified search** — look up blocks, transactions, and addresses from a single search bar
 
 <details>
@@ -124,6 +125,7 @@ bitcoinpr-web/          # Embedded web explorer (Axum HTTP/WS)      [optional: -
   <img src="docs/screenshots/mempool.png" alt="mempool page"/>
   <img src="docs/screenshots/mining.png" alt="mining page"/>
   <img src="docs/screenshots/info.png" alt="info page"/>
+  <img src="docs/screenshots/split.png" alt="chain split monitor page"/>
 </details>
 
 ### Electrum Server
@@ -337,7 +339,7 @@ bitcoin-cli -rpcport=8332 -rpcuser=bitcoinpr -rpcpassword=bitcoinpr getmininginf
 | `--i2psam` | — | I2P SAM bridge (`host:port`) enabling the I2P transport (e.g. i2pd at `127.0.0.1:7656`) |
 | `--i2pacceptincoming` | 1 | Accept inbound I2P connections (when `--i2psam` set) |
 | `--dbcache` | 450 | UTXO database cache size in MB (60% RocksDB block cache, 40% in-memory UTXO entry cache) |
-| `--bip110height` | (per-network) | BIP 110 RDTS fixed-mode activation height override (active from this height, no signaling/expiry). Mainnet computes activation from signaling; mainly for exercising RDTS on regtest |
+| `--bip110height` | (per-network) | BIP 110 RDTS fixed-mode activation height override (active from this height, no signaling/expiry). Mainnet computes activation from signaling; mainly for exercising RDTS on regtest. Ignored once the operator has abandoned the minority chain (`abandonbip110` / web Split page) |
 | `--datacarrier` | 1 | Relay/mine transactions with OP_RETURN outputs; `0` rejects them from the mempool (policy only — see `docs/relay-policy.md`) |
 | `--datacarriersize` | 83 | Max OP_RETURN script size in bytes, including the opcode (Core default 83; Knots uses 42) |
 | `--permitbaremultisig` | 0 | Relay/mine bare (non-P2SH) multisig outputs; `1` restores Bitcoin Core-compatible relay |
@@ -354,14 +356,14 @@ bitcoin-cli -rpcport=8332 -rpcuser=bitcoinpr -rpcpassword=bitcoinpr getblockchai
 
 | Category | Method |
 |----------|--------|
-| Blockchain | `getblockchaininfo`, `getblock`, `getblockhash`, `getblockcount`, `getdifficulty`, `getbestblockhash`, `pruneblockchain` |
+| Blockchain | `getblockchaininfo`, `getblock`, `getblockhash`, `getblockcount`, `getdifficulty`, `getbestblockhash`, `pruneblockchain`, `getchainsplitinfo`, `invalidateblock`, `reconsiderblock` |
 | Transactions | `getrawtransaction`, `sendrawtransaction`, `decoderawtransaction` |
 | UTXO | `gettxout` |
 | Mempool | `getmempoolinfo`, `getrawmempool` |
 | Network | `getnetworkinfo`, `getpeerinfo`, `getconnectioncount` |
 | Util | `validateaddress` (BIP 350: `scriptPubKey`, `witness_version`, `witness_program`), `estimatesmartfee` |
 | Mining | `getblocktemplate` (BIP 22/23: `rules`, `longpollid`, `capabilities`, `default_witness_commitment`, `proposal` mode), `submitblock`, `generatetoaddress`, `getmininginfo` |
-| Control | `stop`, `help`, `uptime`, `getindexinfo` |
+| Control | `stop`, `help`, `uptime`, `getindexinfo`, `abandonbip110` |
 
 ## Testing
 
@@ -375,6 +377,13 @@ cargo test --workspace --all-features
 # Electrum, web, restart/reconnect resilience, and cross-implementation propagation.
 ./scripts/interop-cluster.sh start --build
 ./scripts/interop-test.sh
+
+# BIP-110 chain-split scenario (requires Docker; separate 2-node cluster)
+# Forges an RDTS-violating block on Bitcoin Core past --bip110height, asserts
+# the node holds its chain, the split monitor tracks/arms, and the full
+# "abandon minority chain" capitulation (flag + restart) converges onto the
+# majority chain. --monitor-only skips the capitulation steps.
+./scripts/interop-split-test.sh
 
 # Static quality gate: fmt --check, clippy --all-features -D warnings,
 # cargo audit, cargo machete (unused deps), and the full test suite

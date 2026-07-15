@@ -291,6 +291,31 @@ impl ChainState {
         // stale hashes that strand peers on the losing chain.
         self.header_index.set_height_hash(height, &hash)?;
 
+        // Ensure the connected block's HEADER is stored with cumulative chain
+        // work. Blocks can arrive and connect through the raw-block broadcast
+        // path before header sync ever stored their headers (fresh IBD from a
+        // single peer that pushes blocks): without a stored header, the next
+        // headers batch cannot compute chain work from this block as parent
+        // ("prev header has no stored data") and header sync wedges at the
+        // tip. The parent header exists by induction — genesis is seeded at
+        // datadir init and every connect passes through here.
+        if self.header_index.get_header(&hash)?.is_none() {
+            if let Some(parent) = self.header_index.get_header(&block.header.prev_blockhash)? {
+                let chain_work = crate::validation::add_chain_work(
+                    &parent.chain_work,
+                    &crate::validation::calculate_work(&block.header.target()),
+                );
+                self.header_index.insert_header(
+                    &hash,
+                    &bitcoinpr_storage::StoredHeader {
+                        header: block.header,
+                        height,
+                        chain_work,
+                    },
+                )?;
+            }
+        }
+
         // 9. Store undo data for reorg/rollback support.
         //    Includes spent UTXOs (to re-insert), created outpoints (to remove),
         //    and prev_block_hash (to walk the chain backward without the block store).

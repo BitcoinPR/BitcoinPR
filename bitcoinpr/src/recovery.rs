@@ -242,6 +242,29 @@ pub(crate) fn check_integrity_and_reindex(
             }
         }
 
+        // Anti-wedge startup guard: a crash between marking a block invalid
+        // and resetting the header tip can leave the persisted header tip on
+        // the invalid branch. Detect that and reset the header tip back to
+        // the validated chain so the node doesn't resume following (or
+        // re-downloading) a branch it can never connect.
+        if let (Some(header_tip), Some(best_hash)) =
+            (tmp_hi.get_header_tip()?, tmp_hi.get_best_tip()?)
+        {
+            let best_height = tmp_hi.get_best_height()?.unwrap_or(0);
+            if let Some((bad_hash, bad_height)) =
+                tmp_hi.first_invalid_ancestor(&header_tip, best_height, 10_000)?
+            {
+                warn!(
+                    header_tip = %header_tip,
+                    bad_hash = %bad_hash,
+                    bad_height,
+                    "Persisted header tip is on an invalid branch — resetting to validated tip"
+                );
+                tmp_hi.restore_branch_height_index(&best_hash)?;
+                tmp_hi.reset_fork_header_tip(best_height, &best_hash)?;
+            }
+        }
+
         match tmp_hi.verify_chain_integrity() {
             Ok((verified, best)) if verified < best => {
                 warn!(

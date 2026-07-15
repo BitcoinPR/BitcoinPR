@@ -1,0 +1,110 @@
+# docker-compose.split.yml
+#
+# 2-node BIP-110 chain-split scenario cluster — SEPARATE from the long-lived
+# interop cluster (docker-compose.interop.yml). Fresh named volumes, its own
+# network and project name, remapped host ports, and NO stratum exposure, so
+# the live-bitaxe interop cluster is never touched.
+#
+# Scenario (scripts/interop-split-test.sh):
+#   split-bitcoinpr enforces BIP-110 from height 110 (--bip110height, fixed
+#   mode); split-core does not. Core mines an RDTS-violating block past 110,
+#   the chains split, the monitor tracks both, and the operator can abandon
+#   the minority chain (persistent flag + restart via `restart: unless-stopped`).
+#
+# Usage:
+#   docker compose -p bitcoinpr-split -f docker-compose.split.yml up -d
+#   docker compose -p bitcoinpr-split -f docker-compose.split.yml down -v
+#
+# Prerequisite: the bitcoinpr-local:full image (built by
+#   ./scripts/interop-cluster.sh start --build).
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+services:
+
+  split-bitcoinpr:
+    image: bitcoinpr-local:full
+    container_name: split-bitcoinpr
+    init: true
+    # unless-stopped also restarts after a CLEAN exit — required so the
+    # capitulation flow ("abandon minority chain" → graceful shutdown) comes
+    # back up with the persisted flag applied.
+    restart: unless-stopped
+    mem_limit: 1g
+    logging: *default-logging
+    networks:
+      - split
+    # --connect split-core: the node must have an OUTBOUND peer — header
+    # sync does not engage for a deep catch-up off a purely inbound peer,
+    # which stalls IBD at genesis (Core's addnode side alone is not enough).
+    command: >
+      --network regtest
+      --datadir /data/bitcoinpr
+      --connect split-core:18444
+      --rpcbind 0.0.0.0
+      --rpcuser test
+      --rpcpassword test
+      --rpcport 18443
+      --port 18444
+      --loglevel debug
+      --txindex
+      --bip110height 110
+      --webport 3000
+      --webadmintoken splittest
+      --gossip-private-addrs
+    ports:
+      - "19443:18443"   # RPC
+      - "13000:3000"    # Web explorer (Split page)
+    volumes:
+      - split-bitcoinpr-data:/data/bitcoinpr
+    healthcheck:
+      test: >
+        bash -c 'exec 3<>/dev/tcp/localhost/18543 &&
+          printf "GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3 &&
+          cat <&3 | grep -q "OK"'
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  split-core:
+    # Pinned (not :latest) so the forged-block path (generateblock with raw
+    # tx hex, v0.21+) stays reproducible.
+    image: bitcoin/bitcoin:29
+    container_name: split-core
+    restart: unless-stopped
+    mem_limit: 512m
+    logging: *default-logging
+    networks:
+      - split
+    command:
+      - bitcoind
+      - -regtest
+      - -server=1
+      - -listen=1
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=test
+      - -rpcpassword=test
+      - -rpcport=18443
+      - -port=18444
+      - -addnode=split-bitcoinpr:18444
+      - -dnsseed=0
+      - -fallbackfee=0.0001
+      - -printtoconsole=1
+    ports:
+      - "39443:18443"   # RPC
+    volumes:
+      - split-core-data:/home/bitcoin/.bitcoin
+
+networks:
+  split:
+    driver: bridge
+
+volumes:
+  split-bitcoinpr-data:
+  split-core-data:

@@ -39,7 +39,145 @@ enum DrainStep {
         connected_hash: bitcoin::BlockHash,
     },
     /// Validation failed.
-    Failed { expected_height: u32, error: String },
+    Failed {
+        expected_height: u32,
+        error: String,
+        /// True when the failure is a deterministic consensus rejection —
+        /// the block can never become valid, so it must be durably marked
+        /// invalid and its branch abandoned instead of retried.
+        consensus_invalid: bool,
+    },
+}
+
+/// Classify a block-connect failure: deterministic consensus rejections are
+/// durably markable; local-state and chain-context errors (Storage,
+/// ChainContext, missing UTXO/undo, wrong-block deliveries, corrupt payloads
+/// whose re-fetch could succeed) must stay transient and retryable.
+fn is_consensus_invalid(e: &bitcoinpr_core::CoreError) -> bool {
+    use bitcoinpr_core::CoreError;
+    matches!(
+        e,
+        CoreError::InvalidProofOfWork
+            | CoreError::InvalidTimestamp(_)
+            | CoreError::InvalidDifficultyTarget(_)
+            | CoreError::InvalidBlock(_)
+            | CoreError::InvalidTransaction(_)
+            | CoreError::InvalidScript(_)
+            | CoreError::InvalidCoinbase(_)
+            | CoreError::BlockWeightExceeded { .. }
+            | CoreError::InvalidSubsidy { .. }
+    )
+}
+
+/// After a block on the header-best branch was durably marked invalid, put
+/// the node back on its own chain: repair the height→hash index, reset the
+/// header tip, and — when a failed reorg already disconnected our blocks
+/// (`reorg_from` = the pre-reorg validated tip) — reconnect them from the
+/// local block store. Any block that cannot be replayed locally is left for
+/// normal P2P re-download (the header tip now points back at our branch).
+///
+/// Returns the resulting `(tip_hash, tip_height, chain_work)` for the caller
+/// to mirror into `HeaderSync` and the shared height/hash state.
+fn recover_from_invalid_branch(
+    chain_state: &Arc<tokio::sync::Mutex<ChainState>>,
+    header_index: &Arc<HeaderIndex>,
+    reorg_from: Option<(bitcoin::BlockHash, u32)>,
+) -> (bitcoin::BlockHash, u32, [u8; 32]) {
+    let mut cs = chain_state.blocking_lock();
+
+    // Recovery target: the pre-reorg validated tip when a reorg rolled us
+    // back before the invalid block was discovered, else the current tip.
+    let (mut target_hash, mut target_height) = (cs.best_hash, cs.best_height);
+    if let Some((pre_hash, pre_height)) = reorg_from {
+        if pre_height > target_height {
+            target_hash = pre_hash;
+            target_height = pre_height;
+        }
+    }
+
+    if let Err(e) = header_index.restore_branch_height_index(&target_hash) {
+        warn!(error = %e, "restore_branch_height_index failed during invalid-branch recovery");
+    }
+    if let Err(e) = header_index.reset_fork_header_tip(target_height, &target_hash) {
+        warn!(error = %e, "reset_fork_header_tip failed during invalid-branch recovery");
+    }
+
+    // Replay our own disconnected blocks from local disk.
+    if target_height > cs.best_height {
+        let mut replay = Vec::new();
+        let mut walk_hash = target_hash;
+        let mut walk_height = target_height;
+        let mut connected_walk = true;
+        while walk_height > cs.best_height {
+            replay.push(walk_hash);
+            match header_index.get_header(&walk_hash) {
+                Ok(Some(s)) if s.height == walk_height => {
+                    walk_hash = s.header.prev_blockhash;
+                    walk_height -= 1;
+                }
+                _ => {
+                    connected_walk = false;
+                    break;
+                }
+            }
+        }
+        // The target must descend from our current tip, or replay is invalid.
+        if connected_walk && walk_hash == cs.best_hash {
+            replay.reverse();
+            for hash in replay {
+                let raw = header_index
+                    .get_block_pos(&hash)
+                    .ok()
+                    .flatten()
+                    .and_then(|pos| cs.block_store.read_block(&pos).ok());
+                let block = raw.as_deref().and_then(|r| {
+                    bitcoin::consensus::encode::deserialize::<bitcoin::Block>(r).ok()
+                });
+                let next_height = cs.best_height + 1;
+                match block {
+                    Some(b) => {
+                        if let Err(e) = cs.connect_block_with_raw(&b, next_height, raw.as_deref()) {
+                            error!(
+                                height = next_height,
+                                hash = %hash,
+                                error = %e,
+                                "Replay reconnect failed — remaining blocks will resync over P2P"
+                            );
+                            break;
+                        }
+                        info!(
+                            height = next_height,
+                            hash = %hash,
+                            "Reconnected our block after abandoning invalid branch"
+                        );
+                    }
+                    None => {
+                        warn!(
+                            height = next_height,
+                            hash = %hash,
+                            "Block data unavailable for replay — will resync over P2P"
+                        );
+                        break;
+                    }
+                }
+            }
+        } else {
+            warn!(
+                target = %target_hash,
+                target_height,
+                tip = %cs.best_hash,
+                "Recovery target does not descend from current tip — skipping replay"
+            );
+        }
+    }
+
+    let work = header_index
+        .get_header(&cs.best_hash)
+        .ok()
+        .flatten()
+        .map(|h| h.chain_work)
+        .unwrap_or([0u8; 32]);
+    (cs.best_hash, cs.best_height, work)
 }
 
 /// Byte cap for the pending-block buffer: the old 2048-block count cap
@@ -798,6 +936,8 @@ pub(crate) struct Node {
     /// Block-file prune target in bytes (`--prune <MiB>`); `None` disables
     /// pruning. See `bitcoinpr_storage::prune`.
     pub(crate) prune_target_bytes: Option<u64>,
+    /// Chain-split monitor (rival-branch tracking + capitulation arming).
+    pub(crate) split_monitor: Option<Arc<bitcoinpr_core::SplitMonitor>>,
 }
 
 impl Node {
@@ -840,6 +980,7 @@ impl Node {
             #[cfg(feature = "web")]
             web_peers,
             prune_target_bytes,
+            split_monitor,
         } = self;
 
         // `tx_index` is consumed only by the indexing-gated catch-up below, so
@@ -895,6 +1036,7 @@ impl Node {
         let mut last_ping = std::time::Instant::now();
         // Prune tick bookkeeping (only consulted when --prune is set).
         let mut last_prune_check = std::time::Instant::now();
+        let mut last_split_refresh = std::time::Instant::now();
         let prune_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Track whether an index catch-up is running so we don't start a second one.
         let index_catchup_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -942,6 +1084,11 @@ impl Node {
         // block keeps failing validation. After MAX_BLOCK_RETRIES failures we
         // drop the block, ban the sender, and wait for the chain to resolve.
         let mut block_failure_counts: HashMap<bitcoin::BlockHash, u32> = HashMap::new();
+        // Validated tip captured when a reorg's disconnect phase begins. If the
+        // new branch then fails to connect because a block is consensus-invalid,
+        // recovery reorgs back to this tip (replaying our blocks from disk)
+        // instead of leaving the node stranded at the fork point.
+        let mut last_reorg_from: Option<(bitcoin::BlockHash, u32)> = None;
         const MAX_BLOCK_RETRIES: u32 = 5;
 
         // Periodic tick so the loop wakes up even when no P2P events arrive.
@@ -1352,7 +1499,44 @@ impl Node {
                                             false
                                         };
 
-                                        if !on_best_chain && cs_height > 0 {
+                                        // Anti-wedge: never start a reorg onto a branch that
+                                        // contains a durably marked-invalid block — the connect
+                                        // phase is guaranteed to fail after our valid blocks were
+                                        // already disconnected. Reset the header view back to our
+                                        // chain instead. (Fork choice in HeaderSync normally
+                                        // prevents this, but headers can arrive before the mark
+                                        // exists; this guard closes that window.)
+                                        let invalid_ancestor = if !on_best_chain && cs_height > 0 {
+                                            header_index
+                                                .first_invalid_ancestor(
+                                                    &header_sync.best_hash,
+                                                    cs_height,
+                                                    10_000,
+                                                )
+                                                .ok()
+                                                .flatten()
+                                        } else {
+                                            None
+                                        };
+                                        if let Some((bad_hash, bad_height)) = invalid_ancestor {
+                                            warn!(
+                                                bad_hash = %bad_hash,
+                                                bad_height,
+                                                header_tip = %header_sync.best_hash,
+                                                "Best header branch contains an invalid block — resetting header tip to our chain instead of reorging"
+                                            );
+                                            let _ = header_index.restore_branch_height_index(&cs_hash);
+                                            let _ = header_index.reset_fork_header_tip(cs_height, &cs_hash);
+                                            header_sync.best_hash = cs_hash;
+                                            header_sync.best_height = cs_height;
+                                            header_sync.best_chain_work = header_index
+                                                .get_header(&cs_hash)
+                                                .ok()
+                                                .flatten()
+                                                .map(|h| h.chain_work)
+                                                .unwrap_or([0u8; 32]);
+                                            block_sync.in_flight.clear();
+                                        } else if !on_best_chain && cs_height > 0 {
                                             // Clear any in-flight requests for the old chain —
                                             // they will never connect and must be discarded before
                                             // we reorg to the new best chain.
@@ -1372,6 +1556,10 @@ impl Node {
                                                 header_height = header_sync.best_height,
                                                 "Chain tip not on best header chain, initiating reorg"
                                             );
+                                            // Remember where we reorged from so a consensus-invalid
+                                            // failure on the new branch can reorg back (see
+                                            // recover_from_invalid_branch).
+                                            last_reorg_from = Some((cs_hash, cs_height));
 
                                             // Build the set of hashes on the best header chain
                                             // by walking prev_blockhash links from the tip.
@@ -1523,7 +1711,11 @@ impl Node {
                                                 if !new_hashes.is_empty() {
                                                     block_sync.schedule(new_hashes);
                                                     let peers = shared_peers.read().await;
-                                                    let block_h = chain_state.lock().await.best_height;
+                                                    // `cs` IS the chain-state guard — re-locking
+                                                    // `chain_state` here deadlocks the event loop
+                                                    // (observed: post-capitulation reorg froze at
+                                                    // the fork point with downloads scheduled).
+                                                    let block_h = cs.best_height;
                                 let header_tip = header_index.get_header_tip_height().ok().flatten().unwrap_or(block_h);
                                 let peer_ids = eligible_download_peer_ids(&peers, block_h, header_tip);
                                                     drop(peers);
@@ -2214,6 +2406,14 @@ impl Node {
                             };
                         }
 
+                        // Never re-attempt a block durably marked consensus-invalid.
+                        if hi.is_invalid(&block_hash) {
+                            return DrainStep::Stale {
+                                expected_height,
+                                expected_hash: None,
+                            };
+                        }
+
                         match cs.connect_block_with_raw(
                             &block,
                             expected_height,
@@ -2226,6 +2426,7 @@ impl Node {
                             },
                             Err(e) => DrainStep::Failed {
                                 expected_height,
+                                consensus_invalid: is_consensus_invalid(&e),
                                 error: e.to_string(),
                             },
                         }
@@ -2433,7 +2634,59 @@ impl Node {
                         DrainStep::Failed {
                             expected_height,
                             error,
+                            consensus_invalid,
                         } => {
+                            if consensus_invalid {
+                                // Deterministic rejection: mark the block
+                                // durably invalid (re-fetching cannot help and
+                                // fork choice must stop following its branch),
+                                // reset the header view back to our chain, and
+                                // reconnect anything a failed reorg already
+                                // disconnected.
+                                let reason = if error.contains("BIP-110") {
+                                    bitcoinpr_storage::INVALID_REASON_BIP110
+                                } else {
+                                    bitcoinpr_storage::INVALID_REASON_CONSENSUS
+                                };
+                                error!(
+                                    height = expected_height,
+                                    hash = %block_hash,
+                                    reason,
+                                    error = %error,
+                                    "Block is consensus-invalid — marking permanently and abandoning its branch"
+                                );
+                                if let Err(e) =
+                                    header_index.mark_invalid(&block_hash, expected_height, reason)
+                                {
+                                    error!(error = %e, "Failed to persist invalid-block marker");
+                                }
+                                block_failure_counts.remove(&block_hash);
+                                if let Some(monitor) = &split_monitor {
+                                    monitor.on_invalid_marked(block_hash, expected_height);
+                                }
+
+                                let cs_arc = chain_state.clone();
+                                let hi = header_index.clone();
+                                let reorg_from = last_reorg_from.take();
+                                let (new_tip_hash, new_tip_height, new_tip_work) =
+                                    tokio::task::spawn_blocking(move || {
+                                        recover_from_invalid_branch(&cs_arc, &hi, reorg_from)
+                                    })
+                                    .await
+                                    .expect("invalid-branch recovery task panicked");
+
+                                header_sync.best_hash = new_tip_hash;
+                                header_sync.best_height = new_tip_height;
+                                header_sync.best_chain_work = new_tip_work;
+                                *shared_best_height.write().await = new_tip_height;
+                                *shared_best_hash.write().await = new_tip_hash;
+                                *p2p_best_height.write().unwrap() = new_tip_height as i32;
+                                pending_blocks.clear();
+                                block_sync.queue.clear();
+                                block_sync.in_flight.clear();
+                                break;
+                            }
+
                             let count = block_failure_counts
                                 .entry(block_hash)
                                 .and_modify(|c| *c += 1)
@@ -3074,6 +3327,22 @@ impl Node {
                 }
 
                 last_index_catchup = std::time::Instant::now();
+            }
+
+            // Chain-split monitor: re-evaluate the split picture and publish
+            // a ChainSplit event when it changed. Cheap no-op while no rival
+            // branch is tracked.
+            if let Some(monitor) = &split_monitor {
+                if last_split_refresh.elapsed() > std::time::Duration::from_secs(5) {
+                    last_split_refresh = std::time::Instant::now();
+                    let monitor = monitor.clone();
+                    let tip_hash = *shared_best_hash.read().await;
+                    let tip_height = *shared_best_height.read().await;
+                    tokio::task::spawn_blocking(move || {
+                        monitor.set_our_tip(tip_hash, tip_height);
+                        let _ = monitor.refresh();
+                    });
+                }
             }
 
             // Diagnostic: log pipeline state every 60s when stalled to aid debugging

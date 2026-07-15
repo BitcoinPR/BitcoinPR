@@ -226,6 +226,9 @@ pub(crate) struct Cli {
     /// Sets the height at/after which the seven RDTS rules are enforced (and the
     /// grandfathering cutoff for spent UTXOs). Mainnet defaults to 965664; other
     /// networks have no default. Primarily for testing RDTS enforcement on regtest.
+    /// Ignored once the operator has abandoned the minority chain (the persisted
+    /// "BIP-110 abandoned" flag from abandonbip110 / the web Split page overrides
+    /// this option and the mainnet default on every subsequent start).
     #[arg(long)]
     pub(crate) bip110height: Option<u32>,
 

@@ -22,6 +22,17 @@ pub async fn get_stats(State(state): State<WebState>) -> Json<Value> {
 
     let uptime_secs = state.start_time.elapsed().as_secs();
 
+    // Split page visibility: only surface the tab while the network is
+    // genuinely contested — a tracked rival branch at or above our chain
+    // work. Hidden when no rival is tracked AND once we out-work the rival
+    // (split resolved in our favor); the page stays reachable at #/split
+    // until a restart clears the tracker. Allocation-free state reads.
+    let split_active = state
+        .split_monitor
+        .as_ref()
+        .map(|m| m.rival_leads())
+        .unwrap_or(false);
+
     Json(json!({
         "height": best_height,
         "best_hash": best_hash.to_string(),
@@ -33,6 +44,7 @@ pub async fn get_stats(State(state): State<WebState>) -> Json<Value> {
         "uptime_secs": uptime_secs,
         "node_version": env!("CARGO_PKG_VERSION"),
         "mining_enabled": state.mining_enabled,
+        "split_active": split_active,
     }))
 }
 

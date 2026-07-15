@@ -143,6 +143,9 @@ pub struct RpcState {
     pub prune_target_bytes: Option<u64>,
     /// Network reachability + advertised local addresses for `getnetworkinfo`.
     pub net_status: NetStatus,
+    /// Chain-split monitor (rival-branch tracking); drives
+    /// `getchainsplitinfo`. `None` in test setups.
+    pub split_monitor: Option<Arc<bitcoinpr_core::SplitMonitor>>,
 }
 
 /// The RPC server implementation.
@@ -353,16 +356,28 @@ impl BitcoinRpcServer for RpcServer {
             &best_hash,
             best_height,
         );
+        let abandoned_at = self
+            .state
+            .header_index
+            .get_bip110_abandoned()
+            .ok()
+            .flatten();
         let configured = self.state.params.bip110_activation_height.is_some()
             || self.state.params.bip110_deployment.is_some();
-        if configured {
+        if configured || abandoned_at.is_some() {
             use bitcoinpr_core::ThresholdState;
-            let status = match bip110.state {
-                ThresholdState::Defined => "defined",
-                ThresholdState::Started => "started",
-                ThresholdState::LockedIn => "locked_in",
-                ThresholdState::Active => "active",
-                ThresholdState::Expired => "expired",
+            // The persisted "abandon minority chain" decision overrides the
+            // deployment state: enforcement is (or is about to be) disabled.
+            let status = if abandoned_at.is_some() {
+                "abandoned"
+            } else {
+                match bip110.state {
+                    ThresholdState::Defined => "defined",
+                    ThresholdState::Started => "started",
+                    ThresholdState::LockedIn => "locked_in",
+                    ThresholdState::Active => "active",
+                    ThresholdState::Expired => "expired",
+                }
             };
             if let Some(obj) = value.as_object_mut() {
                 obj.insert(
@@ -370,8 +385,9 @@ impl BitcoinRpcServer for RpcServer {
                     json!({
                         "bip110": {
                             "type": "bip9",
-                            "active": bip110.enforcing(),
+                            "active": bip110.enforcing() && abandoned_at.is_none(),
                             "height": bip110.activation_height,
+                            "abandoned_at": abandoned_at,
                             "bip9": { "bit": 4, "status": status },
                         }
                     }),
@@ -554,6 +570,42 @@ impl BitcoinRpcServer for RpcServer {
 
     fn get_best_block_hash(&self) -> RpcResult<String> {
         Ok(block_in_place(|| self.state.best_hash.blocking_read()).to_string())
+    }
+
+    /// Chain-split monitor status: BIP-110 mode, the tracked rival branch
+    /// (fork point, both tips, block/work deficit, capitulation arming), and
+    /// whether the operator has abandoned BIP-110. `split` is `null` while
+    /// no rival branch is tracked.
+    fn get_chain_split_info(&self) -> RpcResult<Value> {
+        let abandoned_at = self
+            .state
+            .header_index
+            .get_bip110_abandoned()
+            .map_err(|e| rpc_err(-32603, format!("storage error: {e}")))?;
+        let mode = if abandoned_at.is_some() {
+            "abandoned"
+        } else if self.state.params.bip110_activation_height.is_some() {
+            "fixed"
+        } else if self.state.params.bip110_deployment.is_some() {
+            "signaling"
+        } else {
+            "disabled"
+        };
+        let split = self
+            .state
+            .split_monitor
+            .as_ref()
+            .and_then(|m| block_in_place(|| m.snapshot()));
+        Ok(serde_json::json!({
+            "bip110": {
+                "mode": mode,
+                "activation_height": self.state.params.bip110_activation_height,
+            },
+            "split": split,
+            "abandoned": abandoned_at.is_some(),
+            "abandoned_at": abandoned_at,
+            "threshold_blocks": bitcoinpr_core::CAPITULATION_THRESHOLD_BLOCKS,
+        }))
     }
 
     /// Manual prune up to (at most) `height`. Core-compatible: requires the
@@ -1439,6 +1491,194 @@ impl BitcoinRpcServer for RpcServer {
         }
 
         Ok(block_hashes)
+    }
+
+    /// Durably mark a block invalid, as if it failed consensus validation
+    /// (Bitcoin Core parity, backed by the same marker machinery the
+    /// BIP-110 split monitor uses). If the block is on the active validated
+    /// chain, every block from the tip down to it is disconnected and the
+    /// header tip resets to its parent; the node then follows the next-best
+    /// untainted chain. Fork choice never re-adopts the marked branch until
+    /// `reconsiderblock`. Limitation: disconnected transactions are not
+    /// returned to the mempool.
+    fn invalidate_block(&self, blockhash: String) -> RpcResult<Value> {
+        let hash: bitcoin::BlockHash = blockhash
+            .parse()
+            .map_err(|_| rpc_err(-8, "Invalid block hash"))?;
+        let stored = self
+            .state
+            .header_index
+            .get_header(&hash)
+            .map_err(|e| rpc_err(-1, format!("Storage error: {e}")))?
+            .ok_or_else(|| rpc_err(-5, "Block not found"))?;
+        if stored.height == 0 {
+            return Err(rpc_err(-8, "Cannot invalidate the genesis block"));
+        }
+
+        self.state
+            .header_index
+            .mark_invalid(
+                &hash,
+                stored.height,
+                bitcoinpr_storage::INVALID_REASON_MANUAL,
+            )
+            .map_err(|e| rpc_err(-1, format!("Failed to persist marker: {e}")))?;
+        if let Some(monitor) = &self.state.split_monitor {
+            monitor.on_invalid_marked(hash, stored.height);
+        }
+
+        // If the block is on the ACTIVE validated chain, disconnect back to
+        // its parent (Core semantics). Side-branch blocks only get the mark.
+        let mut disconnected = 0u32;
+        let (mut tip_height, mut tip_hash) = (None, None);
+        if let Some(cs_arc) = &self.state.chain_state {
+            let header_index = self.state.header_index.clone();
+            let result: Result<(), String> = block_in_place(|| {
+                let mut cs = cs_arc.blocking_lock();
+                let on_active = cs.best_height >= stored.height
+                    && header_index
+                        .get_hash_at_height(stored.height)
+                        .ok()
+                        .flatten()
+                        == Some(hash);
+                if on_active {
+                    while cs.best_height >= stored.height {
+                        let bh = cs.best_hash;
+                        let h = cs.best_height;
+                        let pos = header_index
+                            .get_block_pos(&bh)
+                            .map_err(|e| format!("block position for {bh}: {e}"))?
+                            .ok_or_else(|| format!("no block data for {bh} (pruned?)"))?;
+                        let raw = cs
+                            .block_store
+                            .read_block(&pos)
+                            .map_err(|e| format!("read block {bh}: {e}"))?;
+                        let block: bitcoin::Block =
+                            bitcoin::consensus::encode::deserialize(&raw)
+                                .map_err(|e| format!("decode block {bh}: {e}"))?;
+                        cs.disconnect_block(&block, h)
+                            .map_err(|e| format!("disconnect {bh} at {h}: {e}"))?;
+                        disconnected += 1;
+                    }
+                    cs.utxo_set
+                        .flush_to_disk()
+                        .map_err(|e| format!("UTXO flush: {e}"))?;
+                    // Reset the header view to the new tip; the node loop's
+                    // invalid-ancestor guard finishes reconciling its own
+                    // header-sync state on the next headers event.
+                    let _ = header_index.restore_branch_height_index(&cs.best_hash);
+                    let _ = header_index.reset_fork_header_tip(cs.best_height, &cs.best_hash);
+                    *self.state.best_height.blocking_write() = cs.best_height;
+                    *self.state.best_hash.blocking_write() = cs.best_hash;
+                }
+                tip_height = Some(cs.best_height);
+                tip_hash = Some(cs.best_hash);
+                Ok(())
+            });
+            result.map_err(|e| {
+                rpc_err(
+                    -1,
+                    format!(
+                        "invalidateblock: disconnect failed mid-reorg ({e}); consider --reindex"
+                    ),
+                )
+            })?;
+        }
+
+        Ok(serde_json::json!({
+            "invalidated": hash.to_string(),
+            "height": stored.height,
+            "disconnected": disconnected,
+            "tip_height": tip_height,
+            "tip_hash": tip_hash.map(|h: bitcoin::BlockHash| h.to_string()),
+        }))
+    }
+
+    /// Remove the invalid marker from a block and every marked descendant
+    /// (Bitcoin Core parity). The cleared branch becomes adoptable again;
+    /// the switch happens when fork choice next evaluates it — on its next
+    /// re-announcement or new block — rather than immediately.
+    fn reconsider_block(&self, blockhash: String) -> RpcResult<Value> {
+        let hash: bitcoin::BlockHash = blockhash
+            .parse()
+            .map_err(|_| rpc_err(-8, "Invalid block hash"))?;
+        let target = self
+            .state
+            .header_index
+            .get_header(&hash)
+            .map_err(|e| rpc_err(-1, format!("Storage error: {e}")))?
+            .ok_or_else(|| rpc_err(-5, "Block not found"))?;
+
+        let markers = self
+            .state
+            .header_index
+            .iter_invalid()
+            .map_err(|e| rpc_err(-1, format!("Storage error: {e}")))?;
+        let mut cleared = 0u32;
+        for (mhash, mheight, _) in markers {
+            let clears = mhash == hash
+                || (mheight > target.height
+                    && block_in_place(|| {
+                        self.state
+                            .header_index
+                            .get_ancestor(&mhash, target.height)
+                            .ok()
+                            .flatten()
+                            .map(|a| a.header.block_hash() == hash)
+                            .unwrap_or(false)
+                    }));
+            if clears {
+                self.state
+                    .header_index
+                    .clear_invalid(&mhash)
+                    .map_err(|e| rpc_err(-1, format!("Failed to clear marker: {e}")))?;
+                cleared += 1;
+            }
+        }
+        Ok(serde_json::json!({
+            "reconsidered": hash.to_string(),
+            "cleared_markers": cleared,
+        }))
+    }
+
+    /// "Abandon minority chain": persist the BIP-110 capitulation flag and
+    /// gracefully shut down. On the next start the node disables RDTS
+    /// enforcement, clears its invalid-block markers, and reorgs onto the
+    /// most-work chain. Refused while the split monitor has not armed (rival
+    /// lead below threshold) unless `force` is passed.
+    fn abandon_bip110(&self, force: Option<bool>) -> RpcResult<Value> {
+        let force = force.unwrap_or(false);
+        let armed = self
+            .state
+            .split_monitor
+            .as_ref()
+            .and_then(|m| block_in_place(|| m.snapshot()))
+            .map(|s| s.capitulation_armed)
+            .unwrap_or(false);
+        if !armed && !force {
+            return Err(rpc_err(
+                -8,
+                "capitulation is not armed (rival chain lead below threshold); \
+                 pass force=true to abandon BIP-110 anyway",
+            ));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.state
+            .header_index
+            .set_bip110_abandoned(now)
+            .map_err(|e| rpc_err(-32603, format!("failed to persist flag: {e}")))?;
+        warn!("abandonbip110: minority chain abandoned by operator — shutting down");
+        self.state
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let tx = self.state.shutdown_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(()).await;
+        });
+        Ok(serde_json::json!({ "abandoned_at": now, "shutting_down": true }))
     }
 
     fn stop(&self) -> RpcResult<String> {

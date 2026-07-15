@@ -5,5 +5,6 @@ pub mod mempool;
 pub mod mining;
 pub mod recent;
 pub mod search;
+pub mod split;
 pub mod stats;
 pub mod txs;

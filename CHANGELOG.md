@@ -5,6 +5,89 @@ Completed work, newest first (moved from TODO.md on 2026-07-11).
 > Note: `docs/archive/…` paths referenced below were removed from the repo
 > on 2026-07-11; retrieve those documents from git history.
 
+## Split-Monitor Follow-ups: Repair-Path Fork Choice, invalidateblock/reconsiderblock, Rival Persistence (2026-07-15)
+
+Closes the three follow-ups logged with the chain-split monitor:
+
+**Headers repair path re-runs fork choice.** Re-announced already-stored
+headers used to take an "index-repair" path that pre-wrote height-index
+entries for branches that never won fork choice — polluting the index above
+the validated tip (three split-monitor misreads and a peer-serving stall
+traced back to it) — while never re-evaluating fork choice, so a cleared
+branch was only adopted on its next new block. The walk now stores nothing
+and remembers the segment's tip; after the batch, fork choice re-evaluates
+it (taint check, strictly-greater work, catch-up guard) and adopts by
+backfilling the branch index + resetting the header tip. Post-capitulation
+and post-`reconsiderblock` convergence now happen from the re-announcement
+alone. Normal batch adoption also backfills ancestor index holes. A
+generation counter on the invalid-marker set invalidates HeaderSync's taint
+memo whenever markers change outside the header path.
+
+**`invalidateblock` / `reconsiderblock` RPCs** (Bitcoin Core parity, on the
+marker machinery): `invalidateblock` durably marks a block
+(`INVALID_REASON_MANUAL`), feeds the split monitor, and — when the block is
+on the active chain — disconnects down to its parent and resets the header
+tip; the node then follows the next-best untainted chain (disconnected
+transactions are not returned to the mempool). `reconsiderblock` clears the
+marker from the block and every marked descendant; the branch is adopted on
+its next fork-choice evaluation.
+
+**Rival tips persist across restarts.** The split monitor's tracked tips are
+written to storage on every change (68-byte records in the header-index
+meta CF) and restored at startup, so a mid-split restart resumes with
+`getchainsplitinfo`/the Split page live immediately — verified by a new
+restart step in `interop-split-test.sh` (which also now asserts convergence
+with no explicit post-capitulation block). Cleared on capitulation and when
+the last rival is pruned.
+
+## BIP-110 Chain-Split Monitor + "Abandon Minority Chain" (2026-07-15)
+
+If BIP-110 activates against majority hashrate, the node follows a minority
+chain. The node now handles that scenario end-to-end. Foundation: durable
+invalid-block markers (new `invalid_blocks` column family, WAL-flushed, with
+an in-memory mirror) and taint-aware fork choice — a heavier chain containing
+a marked-invalid block is stored for observability but can never win fork
+choice or trigger a reorg, closing a wedge where the reorg's disconnect phase
+ran before discovering the new branch's blocks fail validation (recovery
+reorgs back and replays our own blocks from disk). Deterministic consensus
+rejections are marked immediately instead of re-fetched five times; a startup
+guard resets a header tip stranded on an invalid branch.
+
+On top of that: a chain-split monitor (`bitcoinpr-core/src/splitmon.rs`)
+tracks rival branches (fork point, both tips, block + chain-work deficits,
+first invalid block, signaling stats) and arms the operator action at a
+rival lead of 6 blocks AND the equivalent work; surfaced via
+`getchainsplitinfo`, `GET /api/split`, a `ChainSplit` WebSocket event, and a
+web Split page (tab visible only while the split is live — a tracked
+rival at or above our chain work; gone once the rival is out-worked or
+after a post-abandon restart, with the page still reachable by URL). Capitulation is persistent-flag + restart: `POST
+/api/split/capitulate` (typed `ABANDON-BIP110` confirmation, same-origin +
+`--webadmintoken` gating, refused while unarmed unless forced) or
+`abandonbip110 [force]` RPC persists `bip110_abandoned` and gracefully shuts
+down; the next start overrides `--bip110height`/the mainnet deployment,
+clears the invalid markers, and the node reorgs onto the most-work chain
+(`getblockchaininfo` then reports softfork status `abandoned`). Mainnet
+signaling mode additionally classifies mandatory-signaling-window violations
+at header level, excluding a non-signaling rival branch without downloading
+any block bodies.
+
+Three pre-existing bugs found by the new harness and fixed: a reorg-path
+deadlock (the download-scheduling step re-locked `chain_state` while its own
+guard was live, freezing the event loop on any reorg that schedules
+downloads); missing header persistence for blocks connected via raw-block
+broadcast (a fresh node IBD-ing from a single block-pushing peer wedged
+header sync with "prev header has no stored data"); and header sync not
+engaging for deep catch-up off a purely inbound peer.
+
+Gating: dedicated 2-node scenario cluster (`docker-compose.split.yml`,
+separate project/volumes/ports — never touches the live interop cluster) +
+`scripts/interop-split-test.sh`: Core forges a >83-byte OP_RETURN block past
+`--bip110height 110` via `generateblock`, the node holds its chain, the
+monitor arms at +6, capitulation runs over the web API, docker restarts the
+node, and it converges onto Core's chain. Full pass, plus gate.sh and the
+18/18 interop suite green at every phase. 12 new unit tests across storage,
+p2p, core, and web.
+
 ## Stratum Vardiff: Per-Worker Share Difficulty Ramping (2026-07-13)
 
 The stratum gateway used to send a single static `mining.set_difficulty`

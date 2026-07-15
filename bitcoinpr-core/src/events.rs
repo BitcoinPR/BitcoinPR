@@ -45,6 +45,15 @@ pub enum NodeNotification {
         txid: String,
         amount: u64,
     },
+    /// A chain split is being tracked (or its state changed): a rival branch
+    /// with a consensus-invalid block is growing next to our chain.
+    ChainSplit {
+        fork_height: u32,
+        our_height: u32,
+        rival_height: u32,
+        block_deficit: i64,
+        capitulation_armed: bool,
+    },
 }
 
 pub struct EventBus {

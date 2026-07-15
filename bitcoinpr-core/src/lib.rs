@@ -10,6 +10,7 @@ pub mod events;
 pub mod mempool;
 pub mod merkle;
 pub mod script;
+pub mod splitmon;
 pub mod time;
 pub mod validation;
 pub mod versionbits;
@@ -26,6 +27,7 @@ pub use mempool::{
     FeeEstimator, Mempool, MempoolChainContext, MempoolEntry, DEFAULT_MAX_MEMPOOL_BYTES,
 };
 pub use script::{count_sigops, ScriptFlags, SigCache};
+pub use splitmon::{SplitMonitor, SplitSnapshot, TipInfo, CAPITULATION_THRESHOLD_BLOCKS};
 pub use validation::{
     add_chain_work, calculate_next_work_required, calculate_work, compact_target_to_difficulty,
     compute_merkle_root, get_median_time_past, is_final_tx, sequence_lock_points,

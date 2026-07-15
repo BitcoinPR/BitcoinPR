@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use tracing::info;
 
@@ -120,6 +120,8 @@ pub(crate) fn build_router(state: WebState) -> Router {
         )
         .route("/api/search/{query}", get(api::search::search))
         .route("/api/stats", get(api::stats::get_stats))
+        .route("/api/split", get(api::split::get_split))
+        .route("/api/split/capitulate", post(api::split::capitulate))
         .route("/api/info", get(api::info::get_info))
         .route("/api/peers", get(api::stats::get_peers))
         .route("/api/mining", get(api::mining::get_mining_stats))
@@ -262,6 +264,9 @@ mod tests {
             blocks_dir: None,
             services: Vec::new(),
             web_admin_token: token.map(str::to_string),
+            split_monitor: None,
+            shutdown_tx: None,
+            shutting_down: None,
         }
     }
 
@@ -273,6 +278,84 @@ mod tests {
             builder = builder.header(*k, *v);
         }
         builder.body(Body::from("{}")).unwrap()
+    }
+
+    fn post_capitulate(body: &str, extra_headers: &[(&str, &str)]) -> Request<Body> {
+        let mut builder = Request::post("/api/split/capitulate")
+            .header("content-type", "application/json")
+            .header("host", "localhost:3000");
+        for (k, v) in extra_headers {
+            builder = builder.header(*k, *v);
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn capitulate_forbidden_without_token_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = build_router(test_state(dir.path(), None));
+        let resp = router
+            .oneshot(post_capitulate(r#"{"confirm":"ABANDON-BIP110"}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn capitulate_rejects_wrong_phrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = build_router(test_state(dir.path(), Some("tok")));
+        let resp = router
+            .oneshot(post_capitulate(
+                r#"{"confirm":"nope"}"#,
+                &[("authorization", "Bearer tok")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn capitulate_refuses_unarmed_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = test_state(dir.path(), Some("tok"));
+        // Shutdown plumbing present so the arming check is what refuses.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
+        state.shutdown_tx = Some(tx);
+        state.shutting_down = Some(Arc::new(AtomicBool::new(false)));
+        let router = build_router(state);
+        let resp = router
+            .oneshot(post_capitulate(
+                r#"{"confirm":"ABANDON-BIP110"}"#,
+                &[("authorization", "Bearer tok")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn split_endpoint_clean_shape_without_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        // Regtest has no BIP-110 deployment and test_state has no monitor:
+        // the endpoint must still answer with a stable shape.
+        let router = build_router(test_state(dir.path(), None));
+        let resp = router
+            .oneshot(Request::get("/api/split").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["split"].is_null());
+        assert_eq!(v["abandoned"], false);
+        assert_eq!(v["bip110"]["mode"], "disabled");
+        assert_eq!(
+            v["threshold_blocks"],
+            bitcoinpr_core::CAPITULATION_THRESHOLD_BLOCKS
+        );
     }
 
     #[tokio::test]

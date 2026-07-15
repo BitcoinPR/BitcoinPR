@@ -30,6 +30,7 @@
         { pattern: /^\/mempool$/, handler: renderMempool },
         { pattern: /^\/mining$/, handler: renderMining },
         { pattern: /^\/mining\/config$/, handler: renderMiningConfig },
+        { pattern: /^\/split$/, handler: renderSplit },
         { pattern: /^\/(?:info|peers)$/, handler: renderInfo },
     ];
 
@@ -91,6 +92,15 @@
         }
         document.querySelectorAll('[data-route="/mining"], [data-route="/mining/config"]').forEach(function (el) {
             el.style.display = stats.mining_enabled ? '' : 'none';
+        });
+        // The Split tab only exists while a chain split is being tracked (or
+        // after the operator abandoned BIP-110) — a healthy node never shows it.
+        setSplitTabVisible(!!stats.split_active);
+    }
+
+    function setSplitTabVisible(visible) {
+        document.querySelectorAll('[data-route="/split"]').forEach(function (el) {
+            el.style.display = visible ? '' : 'none';
         });
     }
 
@@ -326,6 +336,14 @@
                 break;
             case 'MempoolUpdate':
                 if (currentRoute === '/mempool') renderMempool();
+                break;
+            case 'ChainSplit':
+                // Reveal the tab while the rival is at/ahead of us; hide it
+                // again once the race is won. Keep the page live either way.
+                setSplitTabVisible((msg.block_deficit || 0) >= 0);
+                showToast('Chain split: rival chain at height ' + (msg.rival_height || '?'),
+                    msg.capitulation_armed ? 'error' : 'info');
+                if (currentRoute === '/split') renderSplit();
                 break;
             case 'MiningShare':
                 if (typeof window.onMiningShare === 'function') {
@@ -2434,6 +2452,291 @@
         index: 'Address Index',
         other: 'Other Files',
     };
+
+    /* ---- Chain Split page ---- */
+
+    function splitTipColumn(label, tip, cls) {
+        return `
+            <div class="detail-card">
+                <div class="detail-title"><span class="status-dot ${cls}"></span> ${escapeHtml(label)}</div>
+                <div class="detail-rows">
+                    <div class="detail-row"><span>Height</span><span class="mono">${formatNumber(tip.height)}</span></div>
+                    <div class="detail-row"><span>Tip Hash</span><span class="mono">${escapeHtml(truncateHash(tip.hash, 10))}</span></div>
+                    <div class="detail-row"><span>Chain Work</span><span class="mono">${escapeHtml(truncateHash(tip.work.replace(/^0x0+/, '0x'), 10))}</span></div>
+                </div>
+            </div>`;
+    }
+
+    /* Fork Timechain: pixel-cube view of the divergence — the shared chain
+       up to the fork point, then two lanes racing away from it. Our lane's
+       cubes are real blocks (clickable); the rival lane is header-only (the
+       node never downloads rival block bodies), so its cubes are inert,
+       with the first invalid block called out. */
+
+    function laneHeights(forkHeight, tipHeight, maxCubes) {
+        const all = [];
+        for (let h = forkHeight + 1; h <= tipHeight; h++) all.push(h);
+        if (all.length <= maxCubes) return all;
+        // First block after the fork, a gap marker, then the newest cubes.
+        return [all[0], '…'].concat(all.slice(all.length - (maxCubes - 2)));
+    }
+
+    function rivalCubeHtml(h, s) {
+        const isTip = h === s.rival.height;
+        const inv = s.rival_first_invalid;
+        const isInvalid = inv && h === inv.height;
+        let meta = 'headers only';
+        if (isInvalid) meta = '✕ ' + escapeHtml(inv.reason);
+        else if (isTip) meta = escapeHtml(truncateHash(s.rival.hash, 4));
+        return `
+            <div class="chain-block rival${isInvalid ? ' invalid' : ''}${isTip ? ' tip' : ''}">
+                <span class="chain-block-height">#${formatNumber(h)}</span>
+                <span class="chain-block-meta">${meta}</span>
+            </div>`;
+    }
+
+    async function buildForkStrip(s) {
+        const forkH = s.fork_height;
+        const LANE_MAX = 6;
+
+        // Shared segment: the last blocks both chains agree on (ours = canonical).
+        const sharedHeights = [];
+        for (let h = Math.max(0, forkH - 2); h <= forkH; h++) sharedHeights.push(h);
+        const ourHeights = laneHeights(forkH, s.ours.height, LANE_MAX);
+
+        const wanted = sharedHeights.concat(ourHeights.filter(function (h) { return h !== '…'; }));
+        const fetched = await Promise.all(wanted.map(function (h) {
+            return api('block/' + h).catch(function () { return null; });
+        }));
+        const byHeight = {};
+        fetched.forEach(function (b) { if (b) byHeight[b.height] = b; });
+
+        const gapCube = '<div class="chain-block ghost gap" aria-hidden="true">…</div>';
+        const cube = function (h, extra) {
+            if (h === '…') return gapCube;
+            const b = byHeight[h];
+            if (!b) return gapCube;
+            return chainCubeHtml(b, extra || '');
+        };
+
+        let shared = '';
+        sharedHeights.forEach(function (h) {
+            shared += cube(h, h === forkH ? ' fork-point' : '');
+        });
+
+        let oursLane = '';
+        ourHeights.forEach(function (h) {
+            oursLane += cube(h, h === s.ours.height ? ' tip' : '');
+        });
+
+        let rivalLane = '';
+        laneHeights(forkH, s.rival.height, LANE_MAX).forEach(function (h) {
+            rivalLane += h === '…' ? gapCube : rivalCubeHtml(h, s);
+        });
+
+        return `
+            <div class="chain-strip-wrapper">
+                <div class="chain-strip-title">
+                    The Timechain — divergence at #${formatNumber(forkH)}
+                    <span class="chain-live"><span class="status-dot ${s.capitulation_armed ? 'red' : 'amber'} pulse"></span>live</span>
+                </div>
+                <div class="chain-strip fork-strip">
+                    <div class="fork-shared">${shared}</div>
+                    <div class="fork-connector" aria-hidden="true"></div>
+                    <div class="fork-branches">
+                        <div class="fork-lane">
+                            <span class="fork-lane-label ours-label">ours · bip-110</span>
+                            ${oursLane}
+                        </div>
+                        <div class="fork-lane">
+                            <span class="fork-lane-label rival-label">rival</span>
+                            ${rivalLane}
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+    }
+
+    function renderSplitBody(data, stripHtml) {
+        const s = data.split;
+        const modeLabel = {
+            signaling: 'BIP-110 signaling (MASF) active',
+            fixed: 'BIP-110 fixed activation height' +
+                (data.bip110.activation_height != null ? ' ' + formatNumber(data.bip110.activation_height) : ''),
+            disabled: 'BIP-110 not configured on this network',
+            abandoned: 'BIP-110 ABANDONED by operator',
+        }[data.bip110.mode] || data.bip110.mode;
+
+        let banner;
+        if (data.abandoned) {
+            banner = `<div class="detail-card"><div class="detail-title">
+                <span class="status-dot"></span> Minority chain abandoned</div>
+                <p>BIP-110 rule enforcement is disabled; this node follows the chain
+                with the most accumulated proof of work.</p></div>`;
+        } else if (!s) {
+            banner = `<div class="empty-state">No chain split detected — no rival branch is being tracked.</div>`;
+        } else if (s.block_deficit < 0) {
+            banner = `<div class="detail-card">
+                <div class="detail-title">
+                    <span class="status-dot green"></span>
+                    Divergence resolved — our chain leads
+                </div>
+                <p>Our chain has more accumulated proof of work than the rival branch
+                (${formatNumber(-s.block_deficit)} block${s.block_deficit === -1 ? '' : 's'} ahead).
+                The rival is stale unless it out-mines us; this record clears on restart.</p>
+            </div>`;
+        } else {
+            const armed = s.capitulation_armed;
+            banner = `<div class="detail-card">
+                <div class="detail-title">
+                    <span class="status-dot ${armed ? 'red pulse' : 'amber pulse'}"></span>
+                    ${armed ? 'Rival chain leads beyond threshold' : 'Divergence detected'}
+                </div>
+                <p>${armed
+                    ? 'The rival chain is ' + formatNumber(s.block_deficit) + ' blocks ahead (threshold ' +
+                      s.threshold_blocks + '). You may abandon the minority chain: BIP-110 rules are ' +
+                      'disabled after a restart and the node follows accumulated proof of work.'
+                    : 'A rival branch containing a consensus-invalid block is growing next to this ' +
+                      'node\'s chain. The abandon option unlocks if it gets ' + s.threshold_blocks +
+                      ' blocks ahead.'}</p>
+                <button class="btn-danger" id="capitulate-btn" ${armed ? '' : 'disabled title="Available when the rival chain leads by ' + s.threshold_blocks + '+ blocks"'}>
+                    Abandon minority chain
+                </button>
+            </div>`;
+        }
+
+        let raceSection = '';
+        if (s) {
+            raceSection = `
+                <div class="stats-grid">
+                    ${statCard('Fork Height', formatNumber(s.fork_height), 'accent', 'fork ' + truncateHash(s.fork_hash, 6))}
+                    ${statCard('Our Height', formatNumber(s.ours.height), 'green')}
+                    ${statCard('Rival Height', formatNumber(s.rival.height), 'red')}
+                    ${statCard('Block Deficit', (s.block_deficit >= 0 ? '+' : '') + formatNumber(s.block_deficit), s.capitulation_armed ? 'red' : 'amber',
+                        'threshold ' + s.threshold_blocks)}
+                </div>
+                <div class="info-grid">
+                    ${splitTipColumn('Our Chain (BIP-110)', s.ours, 'green')}
+                    ${splitTipColumn('Rival Chain', s.rival, 'red')}
+                </div>
+                ${s.rival_first_invalid ? `
+                <div class="detail-card">
+                    <div class="detail-title">First Invalid Rival Block</div>
+                    <div class="detail-rows">
+                        <div class="detail-row"><span>Height</span><span class="mono">${formatNumber(s.rival_first_invalid.height)}</span></div>
+                        <div class="detail-row"><span>Hash</span><span class="mono">${escapeHtml(truncateHash(s.rival_first_invalid.hash, 10))}</span></div>
+                        <div class="detail-row"><span>Rejected For</span><span class="mono">${escapeHtml(s.rival_first_invalid.reason)}</span></div>
+                    </div>
+                </div>` : ''}`;
+        }
+
+        return `
+            <div class="page-header">
+                <h1>Chain Split Monitor</h1>
+                <div class="subtitle">${escapeHtml(modeLabel)}</div>
+            </div>
+            ${stripHtml || ''}
+            ${banner}
+            ${raceSection}`;
+    }
+
+    async function renderSplit() {
+        showLoading('Loading split status…');
+        const refresh = async () => {
+            const data = await api('split');
+            // Keep the nav tab in sync while sitting on this page: it only
+            // exists while the split is live (rival at/above our work). A
+            // resolved or abandoned split keeps the page reachable by URL
+            // but drops the tab.
+            setSplitTabVisible(!!data.split_live);
+            let stripHtml = '';
+            if (data.split) {
+                try {
+                    stripHtml = await buildForkStrip(data.split);
+                } catch (_) { /* strip is decorative — page works without it */ }
+            }
+            setPage(renderSplitBody(data, stripHtml));
+            const btn = document.getElementById('capitulate-btn');
+            if (btn && !btn.disabled) {
+                btn.addEventListener('click', () => capitulate(btn));
+            }
+        };
+        try {
+            await refresh();
+        } catch (err) {
+            showError('Split status unavailable', err.message);
+            return;
+        }
+        // Poll while the page is open (cleared by the router on route change).
+        clearDashboardRefresh();
+        dashboardRefreshInterval = setInterval(() => {
+            refresh().catch(() => { /* transient — keep last view */ });
+        }, 10000);
+    }
+
+    async function capitulate(btn) {
+        const typed = window.prompt(
+            'ABANDON MINORITY CHAIN\n\n' +
+            'This permanently disables BIP-110 rule enforcement on this node: ' +
+            'after a restart it discards its minority chain and follows the ' +
+            'chain with the most accumulated proof of work.\n\n' +
+            'Type ABANDON-BIP110 to confirm:');
+        if (typed === null) return;
+        if (typed.trim() !== 'ABANDON-BIP110') {
+            alert('Confirmation phrase mismatch — nothing was done.');
+            return;
+        }
+
+        const doPost = function () {
+            const headers = { 'Content-Type': 'application/json' };
+            const adminToken = sessionStorage.getItem('webAdminToken');
+            if (adminToken) headers['Authorization'] = 'Bearer ' + adminToken;
+            return fetch('/api/split/capitulate', {
+                method: 'POST',
+                headers: headers,
+                body: JSON.stringify({ confirm: 'ABANDON-BIP110' })
+            });
+        };
+
+        btn.disabled = true;
+        try {
+            let res = await doPost();
+            // 401 = token required/wrong: prompt and retry once (403 means
+            // admin actions are disabled server-side or cross-origin).
+            if (res.status === 401) {
+                sessionStorage.removeItem('webAdminToken');
+                const entered = window.prompt(
+                    'Admin token required to abandon the minority chain\n' +
+                    '(the value passed to bitcoinpr via --webadmintoken):');
+                if (entered) {
+                    sessionStorage.setItem('webAdminToken', entered.trim());
+                    res = await doPost();
+                }
+            }
+            if (res.ok) {
+                setPage(`
+                    <div class="page-header"><h1>Chain Split Monitor</h1></div>
+                    <div class="detail-card">
+                        <div class="detail-title"><span class="status-dot amber pulse"></span>
+                            Minority chain abandoned</div>
+                        <p>The node is shutting down. Its supervisor should restart it;
+                        it will then rejoin the majority chain by accumulated proof of
+                        work. This page will recover once the node is back.</p>
+                    </div>`);
+            } else {
+                let msg = 'Capitulation failed (' + res.status + ')';
+                try {
+                    const body = await res.json();
+                    if (body && body.error) msg = body.error;
+                } catch (_) { /* ignore parse error */ }
+                alert(msg);
+                btn.disabled = false;
+            }
+        } catch (err) {
+            alert('Capitulation request failed: ' + err.message);
+            btn.disabled = false;
+        }
+    }
 
     async function renderInfo() {
         showLoading('Loading node info…');

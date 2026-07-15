@@ -14,6 +14,7 @@ const CF_HEADERS: &str = "headers";
 const CF_HEIGHT_INDEX: &str = "height_index";
 const CF_META: &str = "meta";
 const CF_BLOCK_POS: &str = "block_pos";
+const CF_INVALID: &str = "invalid_blocks";
 
 const META_BEST_HASH: &[u8] = b"best_hash";
 const META_BEST_HEIGHT: &[u8] = b"best_height";
@@ -21,6 +22,17 @@ const META_VALIDATED_HEIGHT: &[u8] = b"validated_height";
 const META_HEADER_TIP_HASH: &[u8] = b"header_tip_hash";
 const META_HEADER_TIP_HEIGHT: &[u8] = b"header_tip_height";
 const META_PRUNED_HEIGHT: &[u8] = b"pruned_height";
+const META_BIP110_ABANDONED: &[u8] = b"bip110_abandoned";
+const META_SPLIT_RIVAL_TIPS: &[u8] = b"split_rival_tips";
+
+/// Block failed consensus validation at connect while BIP-110 was enforcing.
+pub const INVALID_REASON_BIP110: u8 = 1;
+/// Block failed consensus validation at connect (non-BIP-110 rules).
+pub const INVALID_REASON_CONSENSUS: u8 = 2;
+/// Header violated the BIP-110 mandatory-signaling window (header-only check).
+pub const INVALID_REASON_SIGNALING: u8 = 3;
+/// Operator marked the block invalid via the `invalidateblock` RPC.
+pub const INVALID_REASON_MANUAL: u8 = 4;
 
 /// Helper to get block hash as a byte slice.
 fn hash_bytes(hash: &BlockHash) -> &[u8] {
@@ -42,6 +54,33 @@ fn add_work(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
         carry = sum >> 8;
     }
     result
+}
+
+/// Subtract two 256-bit big-endian integers (`a - b`), saturating at zero.
+pub fn sub_work(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let mut result = [0u8; 32];
+    let mut borrow = 0i16;
+    for i in (0..32).rev() {
+        let diff = a[i] as i16 - b[i] as i16 - borrow;
+        if diff < 0 {
+            result[i] = (diff + 256) as u8;
+            borrow = 1;
+        } else {
+            result[i] = diff as u8;
+            borrow = 0;
+        }
+    }
+    if borrow != 0 {
+        [0u8; 32] // b > a
+    } else {
+        result
+    }
+}
+
+/// Compare two 256-bit big-endian integers (cumulative chain work).
+pub fn cmp_work(a: &[u8; 32], b: &[u8; 32]) -> std::cmp::Ordering {
+    // Big-endian byte order makes lexicographic comparison numeric.
+    a.cmp(b)
 }
 
 /// Stored header entry containing the header, its height, and cumulative chain work.
@@ -90,6 +129,16 @@ impl StoredHeader {
 /// Stores headers keyed by BlockHash and provides a height-to-hash index.
 pub struct HeaderIndex {
     db: Arc<DB>,
+    /// Hashes of blocks durably marked consensus-invalid (mirror of
+    /// `CF_INVALID`, loaded at open). The set stays tiny — one entry per
+    /// rejected rival-chain block — so membership checks on the hot header
+    /// path are allocation-free and never touch RocksDB.
+    invalid_set: std::sync::RwLock<std::collections::HashSet<BlockHash>>,
+    /// Bumped on every invalid-marker mutation. Lets caches derived from the
+    /// marker set (e.g. HeaderSync's branch-taint memo) detect external
+    /// changes — `invalidateblock`/`reconsiderblock` RPCs, capitulation —
+    /// and invalidate themselves.
+    invalid_generation: std::sync::atomic::AtomicU64,
 }
 
 impl HeaderIndex {
@@ -123,10 +172,32 @@ impl HeaderIndex {
             ColumnFamilyDescriptor::new(CF_HEIGHT_INDEX, cf_opts.clone()),
             ColumnFamilyDescriptor::new(CF_META, Options::default()),
             ColumnFamilyDescriptor::new(CF_BLOCK_POS, cf_opts),
+            ColumnFamilyDescriptor::new(CF_INVALID, Options::default()),
         ];
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
-        Ok(HeaderIndex { db: Arc::new(db) })
+        let index = HeaderIndex {
+            db: Arc::new(db),
+            invalid_set: std::sync::RwLock::new(std::collections::HashSet::new()),
+            invalid_generation: std::sync::atomic::AtomicU64::new(0),
+        };
+        index.load_invalid_set()?;
+        Ok(index)
+    }
+
+    /// Populate the in-memory invalid-hash set from `CF_INVALID`.
+    fn load_invalid_set(&self) -> StorageResult<()> {
+        let cf = self.cf(CF_INVALID)?;
+        let mut set = std::collections::HashSet::new();
+        for entry in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (key, _) = entry?;
+            set.insert(hash_from_bytes(&key)?);
+        }
+        if !set.is_empty() {
+            info!(count = set.len(), "Loaded invalid-block markers");
+        }
+        *self.invalid_set.write().expect("invalid_set lock poisoned") = set;
+        Ok(())
     }
 
     /// Insert a header into the index.
@@ -719,6 +790,289 @@ impl HeaderIndex {
             None => Ok(None),
         }
     }
+
+    /// Durably mark a block hash as consensus-invalid (`INVALID_REASON_*`).
+    ///
+    /// The marker is WAL-flushed before returning: it is what keeps the node
+    /// from re-adopting (and re-wedging on) a heavier invalid chain across
+    /// restarts, so it must never be lost to a crash.
+    pub fn mark_invalid(&self, hash: &BlockHash, height: u32, reason: u8) -> StorageResult<()> {
+        let cf = self.cf(CF_INVALID)?;
+        let mut value = [0u8; 5];
+        value[0] = reason;
+        value[1..5].copy_from_slice(&height.to_le_bytes());
+        self.db.put_cf(&cf, hash_bytes(hash), value)?;
+        self.flush_wal()?;
+        self.invalid_set
+            .write()
+            .expect("invalid_set lock poisoned")
+            .insert(*hash);
+        self.invalid_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        warn!(%hash, height, reason, "Marked block consensus-invalid");
+        Ok(())
+    }
+
+    /// Current invalid-marker generation; changes whenever a marker is added
+    /// or removed. Compare-and-refresh point for derived caches.
+    pub fn invalid_generation(&self) -> u64 {
+        self.invalid_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Remove a single invalid-block marker (`reconsiderblock`). No-op if
+    /// the hash was not marked.
+    pub fn clear_invalid(&self, hash: &BlockHash) -> StorageResult<()> {
+        let cf = self.cf(CF_INVALID)?;
+        self.db.delete_cf(&cf, hash_bytes(hash))?;
+        self.flush_wal()?;
+        let removed = self
+            .invalid_set
+            .write()
+            .expect("invalid_set lock poisoned")
+            .remove(hash);
+        if removed {
+            self.invalid_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            info!(%hash, "Cleared invalid-block marker");
+        }
+        Ok(())
+    }
+
+    /// Whether `hash` has been marked consensus-invalid. Memory-only; never
+    /// touches RocksDB.
+    pub fn is_invalid(&self, hash: &BlockHash) -> bool {
+        self.invalid_set
+            .read()
+            .expect("invalid_set lock poisoned")
+            .contains(hash)
+    }
+
+    /// Read a block's invalid marker: `(height, reason)`.
+    pub fn get_invalid(&self, hash: &BlockHash) -> StorageResult<Option<(u32, u8)>> {
+        let cf = self.cf(CF_INVALID)?;
+        match self.db.get_cf(&cf, hash_bytes(hash))? {
+            Some(data) => {
+                if data.len() != 5 {
+                    return Err(StorageError::Serialization(
+                        "invalid marker data length".into(),
+                    ));
+                }
+                let reason = data[0];
+                let height =
+                    u32::from_le_bytes(data[1..5].try_into().expect("length checked above"));
+                Ok(Some((height, reason)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// All invalid markers as `(hash, height, reason)`.
+    pub fn iter_invalid(&self) -> StorageResult<Vec<(BlockHash, u32, u8)>> {
+        let cf = self.cf(CF_INVALID)?;
+        let mut out = Vec::new();
+        for entry in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (key, value) = entry?;
+            if value.len() != 5 {
+                return Err(StorageError::Serialization(
+                    "invalid marker data length".into(),
+                ));
+            }
+            let height = u32::from_le_bytes(value[1..5].try_into().expect("length checked above"));
+            out.push((hash_from_bytes(&key)?, height, value[0]));
+        }
+        Ok(out)
+    }
+
+    /// Number of invalid-block markers.
+    pub fn invalid_count(&self) -> usize {
+        self.invalid_set
+            .read()
+            .expect("invalid_set lock poisoned")
+            .len()
+    }
+
+    /// Remove every invalid-block marker (operator capitulation: the rival
+    /// chain must become adoptable again). A genuinely invalid block simply
+    /// fails connect and gets re-marked, so clearing everything is safe.
+    pub fn clear_all_invalid(&self) -> StorageResult<()> {
+        let cf = self.cf(CF_INVALID)?;
+        let mut batch = WriteBatch::default();
+        let mut cleared = 0usize;
+        for entry in self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start) {
+            let (key, _) = entry?;
+            batch.delete_cf(&cf, key);
+            cleared += 1;
+        }
+        self.db.write(batch)?;
+        self.flush_wal()?;
+        self.invalid_set
+            .write()
+            .expect("invalid_set lock poisoned")
+            .clear();
+        self.invalid_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if cleared > 0 {
+            info!(cleared, "Cleared all invalid-block markers");
+        }
+        Ok(())
+    }
+
+    /// Walk `prev_blockhash` links from `tip` looking for marked-invalid
+    /// ancestors. Returns the *earliest* (lowest-height) invalid block on the
+    /// branch, or `None` if the branch is clean.
+    ///
+    /// Short-circuits once the walk lands on the canonical chain at or below
+    /// `validated_height` (everything below a validated canonical block is
+    /// clean by construction), and gives up with a warning after `max_walk`
+    /// steps so a pathological header chain cannot stall the caller.
+    pub fn first_invalid_ancestor(
+        &self,
+        tip: &BlockHash,
+        validated_height: u32,
+        max_walk: u32,
+    ) -> StorageResult<Option<(BlockHash, u32)>> {
+        if self
+            .invalid_set
+            .read()
+            .expect("invalid_set lock poisoned")
+            .is_empty()
+        {
+            return Ok(None);
+        }
+        let mut current_hash = *tip;
+        let mut found = None;
+        for _ in 0..max_walk {
+            let stored = match self.get_header(&current_hash)? {
+                Some(s) => s,
+                None => return Ok(found), // branch root unknown; report what we saw
+            };
+            if self.is_invalid(&current_hash) {
+                found = Some((current_hash, stored.height));
+            }
+            if stored.height <= validated_height {
+                if let Some(canonical) = self.get_hash_at_height(stored.height)? {
+                    if canonical == current_hash {
+                        return Ok(found);
+                    }
+                }
+            }
+            if stored.height == 0 {
+                return Ok(found);
+            }
+            current_hash = stored.header.prev_blockhash;
+        }
+        warn!(
+            %tip,
+            max_walk,
+            "first_invalid_ancestor walk bound hit before reaching canonical chain"
+        );
+        Ok(found)
+    }
+
+    /// Re-point `CF_HEIGHT_INDEX` at the branch ending in `tip_hash`, walking
+    /// prev links until the index entry already matches (the branch has merged
+    /// into the canonical mapping). Returns `(tip_height, entries_fixed)`.
+    ///
+    /// Used after a failed reorg: the reorg's connect phase rewrites height
+    /// entries to the (now known-invalid) rival chain before its blocks fail
+    /// validation, and the index must be restored to our chain before the
+    /// header tip is reset.
+    pub fn restore_branch_height_index(&self, tip_hash: &BlockHash) -> StorageResult<(u32, u32)> {
+        let tip = self.get_header(tip_hash)?.ok_or_else(|| {
+            StorageError::Serialization(format!(
+                "restore_branch_height_index: unknown tip {tip_hash}"
+            ))
+        })?;
+        let cf_height = self.cf(CF_HEIGHT_INDEX)?;
+        let mut batch = WriteBatch::default();
+        let mut fixed = 0u32;
+        let mut current_hash = *tip_hash;
+        let mut current = tip.clone();
+        loop {
+            match self.get_hash_at_height(current.height)? {
+                Some(h) if h == current_hash => break, // canonical from here down
+                _ => {
+                    batch.put_cf(
+                        &cf_height,
+                        current.height.to_be_bytes(),
+                        hash_bytes(&current_hash),
+                    );
+                    fixed += 1;
+                }
+            }
+            if current.height == 0 {
+                break;
+            }
+            current_hash = current.header.prev_blockhash;
+            current = match self.get_header(&current_hash)? {
+                // Defensive: heights must strictly decrease along prev links.
+                Some(parent) if parent.height < current.height => parent,
+                _ => {
+                    return Err(StorageError::Serialization(format!(
+                        "restore_branch_height_index: broken prev link at {current_hash}"
+                    )))
+                }
+            };
+        }
+        self.db.write(batch)?;
+        info!(
+            tip = %tip_hash,
+            height = tip.height,
+            fixed,
+            "Restored height index to branch"
+        );
+        Ok((tip.height, fixed))
+    }
+
+    /// Persist the operator's decision to abandon BIP-110 ("abandon minority
+    /// chain"). WAL-flushed before returning — the flag must survive the
+    /// shutdown that immediately follows it.
+    pub fn set_bip110_abandoned(&self, unix_ts: u64) -> StorageResult<()> {
+        let cf = self.cf(CF_META)?;
+        self.db
+            .put_cf(&cf, META_BIP110_ABANDONED, unix_ts.to_le_bytes())?;
+        self.flush_wal()?;
+        warn!(unix_ts, "BIP-110 abandoned flag persisted");
+        Ok(())
+    }
+
+    /// Read the BIP-110 abandoned flag (unix timestamp of the decision).
+    pub fn get_bip110_abandoned(&self) -> StorageResult<Option<u64>> {
+        let cf = self.cf(CF_META)?;
+        match self.db.get_cf(&cf, META_BIP110_ABANDONED)? {
+            Some(data) => {
+                let ts = u64::from_le_bytes(data.try_into().map_err(|_| {
+                    StorageError::Serialization("invalid bip110_abandoned bytes".into())
+                })?);
+                Ok(Some(ts))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the split monitor's tracked rival tips (opaque serialized
+    /// blob) so a restart mid-split resumes with the split visible instead
+    /// of waiting for the next rival header batch.
+    pub fn set_split_rival_tips(&self, blob: &[u8]) -> StorageResult<()> {
+        let cf = self.cf(CF_META)?;
+        self.db.put_cf(&cf, META_SPLIT_RIVAL_TIPS, blob)?;
+        Ok(())
+    }
+
+    /// Read the persisted rival-tip blob (see `set_split_rival_tips`).
+    pub fn get_split_rival_tips(&self) -> StorageResult<Option<Vec<u8>>> {
+        let cf = self.cf(CF_META)?;
+        Ok(self.db.get_cf(&cf, META_SPLIT_RIVAL_TIPS)?)
+    }
+
+    /// Remove the persisted rival-tip blob (capitulation, or nothing left
+    /// to track).
+    pub fn clear_split_rival_tips(&self) -> StorageResult<()> {
+        let cf = self.cf(CF_META)?;
+        self.db.delete_cf(&cf, META_SPLIT_RIVAL_TIPS)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -917,5 +1271,245 @@ mod tests {
         assert_eq!(cw_at(&h2), w2, "corrupt chain work must be repaired");
         assert_eq!(cw_at(&h3), w3, "repair must cascade to descendants");
         assert_eq!(cw_at(&h1), w1, "correct entries must be untouched");
+    }
+
+    /// Build a header with the standard test shape (regtest bits, unique by
+    /// `nonce`).
+    fn mk_header(prev: BlockHash, nonce: u32) -> bitcoin::block::Header {
+        bitcoin::block::Header {
+            version: bitcoin::block::Version::from_consensus(4),
+            prev_blockhash: prev,
+            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+            time: 1_700_000_000 + nonce,
+            bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+            nonce,
+        }
+    }
+
+    fn store(index: &HeaderIndex, header: bitcoin::block::Header, height: u32) {
+        index
+            .insert_header(
+                &header.block_hash(),
+                &StoredHeader {
+                    header,
+                    height,
+                    chain_work: [0u8; 32],
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_invalid_markers_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let h1 = mk_header(BlockHash::all_zeros(), 1);
+        let hash = h1.block_hash();
+
+        {
+            let index = HeaderIndex::open(dir.path()).unwrap();
+            assert!(!index.is_invalid(&hash));
+            index
+                .mark_invalid(&hash, 116, INVALID_REASON_BIP110)
+                .unwrap();
+            assert!(index.is_invalid(&hash));
+            assert_eq!(index.get_invalid(&hash).unwrap(), Some((116, 1)));
+            assert_eq!(index.invalid_count(), 1);
+        }
+
+        // Reopen: the in-memory set must be reloaded from CF_INVALID.
+        let index = HeaderIndex::open(dir.path()).unwrap();
+        assert!(index.is_invalid(&hash));
+        assert_eq!(
+            index.iter_invalid().unwrap(),
+            vec![(hash, 116, INVALID_REASON_BIP110)]
+        );
+
+        // Clearing empties both the CF and the set, and survives reopen.
+        index.clear_all_invalid().unwrap();
+        assert!(!index.is_invalid(&hash));
+        assert_eq!(index.invalid_count(), 0);
+        drop(index);
+        let index = HeaderIndex::open(dir.path()).unwrap();
+        assert!(!index.is_invalid(&hash));
+        assert!(index.iter_invalid().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_first_invalid_ancestor_on_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = HeaderIndex::open(dir.path()).unwrap();
+
+        // Canonical chain c1..c3 (height-indexed), fork f2..f3 off c1
+        // (hash-only, like real fork headers).
+        let c1 = mk_header(BlockHash::all_zeros(), 1);
+        let c2 = mk_header(c1.block_hash(), 2);
+        let c3 = mk_header(c2.block_hash(), 3);
+        for (h, ht) in [(c1, 1u32), (c2, 2), (c3, 3)] {
+            store(&index, h, ht);
+        }
+        let f2 = mk_header(c1.block_hash(), 102);
+        let f3 = mk_header(f2.block_hash(), 103);
+        index
+            .insert_headers_hash_only(&[
+                (
+                    f2.block_hash(),
+                    StoredHeader {
+                        header: f2,
+                        height: 2,
+                        chain_work: [0u8; 32],
+                    },
+                ),
+                (
+                    f3.block_hash(),
+                    StoredHeader {
+                        header: f3,
+                        height: 3,
+                        chain_work: [0u8; 32],
+                    },
+                ),
+            ])
+            .unwrap();
+
+        // No markers at all → clean, no walk.
+        assert!(index
+            .first_invalid_ancestor(&f3.block_hash(), 3, 100)
+            .unwrap()
+            .is_none());
+
+        index
+            .mark_invalid(&f2.block_hash(), 2, INVALID_REASON_CONSENSUS)
+            .unwrap();
+
+        // Fork tip finds the earliest invalid ancestor.
+        assert_eq!(
+            index
+                .first_invalid_ancestor(&f3.block_hash(), 3, 100)
+                .unwrap(),
+            Some((f2.block_hash(), 2))
+        );
+        // The marked block itself is found from itself.
+        assert_eq!(
+            index
+                .first_invalid_ancestor(&f2.block_hash(), 3, 100)
+                .unwrap(),
+            Some((f2.block_hash(), 2))
+        );
+        // The canonical tip is clean (short-circuits on the height index).
+        assert!(index
+            .first_invalid_ancestor(&c3.block_hash(), 3, 100)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_restore_branch_height_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = HeaderIndex::open(dir.path()).unwrap();
+
+        let c1 = mk_header(BlockHash::all_zeros(), 1);
+        let c2 = mk_header(c1.block_hash(), 2);
+        let c3 = mk_header(c2.block_hash(), 3);
+        for (h, ht) in [(c1, 1u32), (c2, 2), (c3, 3)] {
+            store(&index, h, ht);
+        }
+
+        // Simulate a failed reorg clobbering heights 2-3 with fork hashes.
+        let f2 = mk_header(c1.block_hash(), 102);
+        let f3 = mk_header(f2.block_hash(), 103);
+        index.set_height_hash(2, &f2.block_hash()).unwrap();
+        index.set_height_hash(3, &f3.block_hash()).unwrap();
+
+        let (tip_height, fixed) = index.restore_branch_height_index(&c3.block_hash()).unwrap();
+        assert_eq!(tip_height, 3);
+        assert_eq!(fixed, 2, "only the clobbered entries are rewritten");
+        assert_eq!(index.get_hash_at_height(2).unwrap(), Some(c2.block_hash()));
+        assert_eq!(index.get_hash_at_height(3).unwrap(), Some(c3.block_hash()));
+        assert_eq!(index.get_hash_at_height(1).unwrap(), Some(c1.block_hash()));
+
+        // Idempotent: nothing left to fix.
+        let (_, fixed) = index.restore_branch_height_index(&c3.block_hash()).unwrap();
+        assert_eq!(fixed, 0);
+    }
+
+    #[test]
+    fn test_work_arithmetic() {
+        let mut a = [0u8; 32];
+        a[31] = 10;
+        let mut b = [0u8; 32];
+        b[31] = 3;
+
+        let diff = sub_work(&a, &b);
+        assert_eq!(diff[31], 7);
+        assert_eq!(&diff[..31], &[0u8; 31][..]);
+
+        // Saturates at zero when b > a.
+        assert_eq!(sub_work(&b, &a), [0u8; 32]);
+
+        // Borrow propagation across bytes: 0x0100 - 0x01 = 0xff.
+        let mut c = [0u8; 32];
+        c[30] = 1;
+        let mut d = [0u8; 32];
+        d[31] = 1;
+        let diff = sub_work(&c, &d);
+        assert_eq!(diff[31], 0xff);
+        assert_eq!(diff[30], 0);
+
+        assert_eq!(cmp_work(&a, &b), std::cmp::Ordering::Greater);
+        assert_eq!(cmp_work(&b, &a), std::cmp::Ordering::Less);
+        assert_eq!(cmp_work(&a, &a), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_invalid_generation_and_single_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = HeaderIndex::open(dir.path()).unwrap();
+        let h1 = mk_header(BlockHash::all_zeros(), 1);
+        let h2 = mk_header(h1.block_hash(), 2);
+
+        let g0 = index.invalid_generation();
+        index
+            .mark_invalid(&h1.block_hash(), 1, INVALID_REASON_MANUAL)
+            .unwrap();
+        index
+            .mark_invalid(&h2.block_hash(), 2, INVALID_REASON_MANUAL)
+            .unwrap();
+        assert!(index.invalid_generation() > g0, "marks bump the generation");
+
+        // Single clear removes only its marker and bumps the generation.
+        let g1 = index.invalid_generation();
+        index.clear_invalid(&h1.block_hash()).unwrap();
+        assert!(!index.is_invalid(&h1.block_hash()));
+        assert!(index.is_invalid(&h2.block_hash()));
+        assert!(index.invalid_generation() > g1);
+
+        // Clearing an unmarked hash is a no-op (no generation bump).
+        let g2 = index.invalid_generation();
+        index.clear_invalid(&h1.block_hash()).unwrap();
+        assert_eq!(index.invalid_generation(), g2);
+    }
+
+    #[test]
+    fn test_split_rival_tips_blob_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = HeaderIndex::open(dir.path()).unwrap();
+        assert!(index.get_split_rival_tips().unwrap().is_none());
+        let blob = vec![7u8; 68];
+        index.set_split_rival_tips(&blob).unwrap();
+        assert_eq!(index.get_split_rival_tips().unwrap(), Some(blob));
+        index.clear_split_rival_tips().unwrap();
+        assert!(index.get_split_rival_tips().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_bip110_abandoned_flag_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let index = HeaderIndex::open(dir.path()).unwrap();
+            assert_eq!(index.get_bip110_abandoned().unwrap(), None);
+            index.set_bip110_abandoned(1_752_537_600).unwrap();
+            assert_eq!(index.get_bip110_abandoned().unwrap(), Some(1_752_537_600));
+        }
+        let index = HeaderIndex::open(dir.path()).unwrap();
+        assert_eq!(index.get_bip110_abandoned().unwrap(), Some(1_752_537_600));
     }
 }

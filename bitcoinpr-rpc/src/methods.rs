@@ -28,6 +28,18 @@ pub trait BitcoinRpc {
     #[method(name = "pruneblockchain")]
     fn prune_blockchain(&self, height: u32) -> RpcResult<u32>;
 
+    #[method(name = "getchainsplitinfo")]
+    fn get_chain_split_info(&self) -> RpcResult<Value>;
+
+    #[method(name = "abandonbip110")]
+    fn abandon_bip110(&self, force: Option<bool>) -> RpcResult<Value>;
+
+    #[method(name = "invalidateblock")]
+    fn invalidate_block(&self, blockhash: String) -> RpcResult<Value>;
+
+    #[method(name = "reconsiderblock")]
+    fn reconsider_block(&self, blockhash: String) -> RpcResult<Value>;
+
     // --- Raw transactions ---
 
     #[method(name = "getrawtransaction")]
