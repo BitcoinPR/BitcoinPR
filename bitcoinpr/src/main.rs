@@ -411,6 +411,78 @@ async fn main() -> anyhow::Result<()> {
     // Phase D: Repair missing height→hash entries in the header index.
     recovery::phase_d_repair_height_index(&header_index, &block_store, best_height, best_hash);
 
+    // BIP-110 late-upgrade chainstate gap (blockslop.dev audit): RDTS rules
+    // run only in connect_block, but startup trusts the persisted chainstate.
+    // If the enforcement config changed between runs (pre-BIP110 datadir
+    // upgraded in place, --bip110height added/lowered, abandoned flag
+    // flipped), already-validated blocks were never checked under the current
+    // rules. Fingerprint the effective config in header-index META; fail
+    // closed when the current config would enforce at or below the validated
+    // tip over a range the stored fingerprint doesn't cover. Our
+    // --reindex-chainstate is a true replay-from-genesis through full
+    // connect_block, so it re-covers everything.
+    {
+        let fingerprint = bitcoinpr_core::bip110_config_fingerprint(&params);
+        let stored = header_index.get_bip110_config_fingerprint()?;
+        let matches = stored.as_ref().is_some_and(|(f, _)| *f == fingerprint);
+        let default_fingerprint =
+            bitcoinpr_core::bip110_config_fingerprint(&ConsensusParams::for_network(network));
+        if matches {
+            // Covered: everything validated since `covered_from` ran under
+            // exactly this config.
+        } else if stored.is_none() && fingerprint == default_fingerprint {
+            // Grandfather pre-fingerprint datadirs running the unmodified
+            // network default: BIP-110 enforcement in connect_block shipped
+            // before fingerprinting did, so any chainstate this lineage built
+            // under the default config WAS validated under it — a missing
+            // record only means the binary that wrote it predates the record.
+            // Non-default configs (or a stored mismatch) never take this path.
+            header_index.set_bip110_config_fingerprint(&fingerprint, 0)?;
+            info!(
+                fingerprint = %fingerprint,
+                "BIP-110 enforcement-config fingerprint initialized \
+                 (default config, pre-existing datadir grandfathered)"
+            );
+        } else {
+            let earliest = bitcoinpr_core::bip110_earliest_enforced_height(
+                &params,
+                &header_index,
+                &best_hash,
+                best_height,
+            );
+            if let Some(enforced_from) = earliest {
+                if best_height > 0 && enforced_from <= best_height {
+                    error!(
+                        fingerprint = %fingerprint,
+                        stored = ?stored,
+                        enforced_from,
+                        validated_height = best_height,
+                        "BIP-110 enforcement config changed and would enforce over \
+                         blocks validated without it — refusing to trust the chainstate"
+                    );
+                    anyhow::bail!(
+                        "BIP-110 enforcement config changed (now `{}`, previously `{}`): blocks \
+                         up to height {} were validated without the current rules, which enforce \
+                         from height {}. Restart with --reindex-chainstate to revalidate the \
+                         chain from genesis under the current config.",
+                        fingerprint,
+                        stored
+                            .map(|(f, _)| f)
+                            .unwrap_or_else(|| "unrecorded".into()),
+                        best_height,
+                        enforced_from
+                    );
+                }
+            }
+            header_index.set_bip110_config_fingerprint(&fingerprint, best_height)?;
+            info!(
+                fingerprint = %fingerprint,
+                covered_from = best_height,
+                "BIP-110 enforcement-config fingerprint recorded"
+            );
+        }
+    }
+
     // Initialize optional transaction index
     let tx_index = if txindex_enabled {
         let idx = Arc::new(TxIndex::open(&net_dir.join("txindex"))?);
@@ -442,13 +514,17 @@ async fn main() -> anyhow::Result<()> {
                                 {
                                     let txids: Vec<bitcoin::Txid> =
                                         block.txdata.iter().map(|tx| tx.compute_txid()).collect();
-                                    if let Err(e) =
-                                        backfill_idx.index_block_at_height(&hash, &txids, h)
-                                    {
+                                    let tx_locs = bitcoinpr_storage::compute_tx_locations(&block);
+                                    if let Err(e) = backfill_idx.index_block_at_height(
+                                        &hash,
+                                        &txids,
+                                        h,
+                                        Some(&tx_locs),
+                                    ) {
                                         warn!(height = h, error = %e, "TxIndex backfill error");
                                     }
                                     backfill_count += 1;
-                                    if backfill_count % 1000 == 0 {
+                                    if backfill_count.is_multiple_of(1000) {
                                         info!(
                                             height = h,
                                             indexed = backfill_count,
@@ -567,12 +643,12 @@ async fn main() -> anyhow::Result<()> {
 
             let mut cs = chain_state.lock().await;
             match cs.connect_block_with_raw(&block, replay_h, Some(&raw)) {
-                Ok(()) => {
+                Ok(_) => {
                     best_height = cs.best_height;
                     best_hash = cs.best_hash;
                     drop(cs);
                     replayed += 1;
-                    if replayed % 10000 == 0 {
+                    if replayed.is_multiple_of(10000) {
                         let elapsed = replay_start.elapsed().as_secs();
                         let bps = if elapsed > 0 {
                             replayed as u64 / elapsed

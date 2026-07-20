@@ -134,7 +134,7 @@ impl VersionBitsTracker {
     /// Update deployment states based on a new block at the given height and MTP.
     /// Should be called at each retarget boundary (height % 2016 == 0).
     pub fn update_states(&mut self, height: u32, median_time: u64, signal_counts: &[u32]) {
-        if height % RETARGET_PERIOD != 0 {
+        if !height.is_multiple_of(RETARGET_PERIOD) {
             return;
         }
 

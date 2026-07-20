@@ -225,7 +225,7 @@ pub struct Mempool {
     /// All transactions indexed by txid.
     txs: HashMap<Txid, MempoolEntry>,
     /// Track which outpoints are spent by mempool transactions.
-    spent_outpoints: HashMap<OutPoint, Txid>,
+    spent_outpoints: bitcoinpr_storage::FastHashMap<OutPoint, Txid>,
     /// Memory budget in bytes, measured against [`Mempool::memory_usage`]
     /// (Core's `-maxmempool` semantics). When a new tx would exceed it, the
     /// lowest-feerate entries (with their descendants) are evicted to make
@@ -247,7 +247,7 @@ impl Mempool {
     pub fn new(max_memory_bytes: usize) -> Self {
         Mempool {
             txs: HashMap::new(),
-            spent_outpoints: HashMap::new(),
+            spent_outpoints: bitcoinpr_storage::FastHashMap::default(),
             max_memory_bytes,
             total_tx_bytes: 0,
             eviction_fee_floor: 0.0,
@@ -820,10 +820,19 @@ impl Mempool {
     }
 
     /// Remove all transactions that are confirmed in a block.
-    pub fn remove_for_block(&mut self, block: &bitcoin::Block) {
+    ///
+    /// `txids` are the block's precomputed txids (`txids[i]` for
+    /// `block.txdata[i]`), as returned by `ChainState::connect_block` — the
+    /// connect path already paid for them, so don't recompute here.
+    pub fn remove_for_block(&mut self, block: &bitcoin::Block, txids: &[Txid]) {
+        // During IBD the mempool is empty for every connected block; skip the
+        // per-tx removal/conflict scan entirely (Core #32827 analogue).
+        if self.txs.is_empty() && self.spent_outpoints.is_empty() {
+            return;
+        }
+        debug_assert_eq!(block.txdata.len(), txids.len());
         let mut removed = 0;
-        for tx in &block.txdata {
-            let txid = tx.compute_txid();
+        for (tx, &txid) in block.txdata.iter().zip(txids) {
             if self.remove_entry(&txid).is_some() {
                 removed += 1;
             }

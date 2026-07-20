@@ -16,8 +16,9 @@ pub mod validation;
 pub mod versionbits;
 
 pub use bip110::{
-    activation_at as bip110_activation_at, Bip110Activation, Bip110Checker, Bip110Deployment,
-    ThresholdState,
+    activation_at as bip110_activation_at, config_fingerprint as bip110_config_fingerprint,
+    earliest_enforced_height as bip110_earliest_enforced_height, Bip110Activation, Bip110Checker,
+    Bip110Deployment, ThresholdState,
 };
 pub use chain::ChainState;
 pub use consensus::ConsensusParams;

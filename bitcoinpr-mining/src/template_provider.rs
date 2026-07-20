@@ -884,7 +884,7 @@ fn calculate_next_bits(
     let interval = (params.pow_target_timespan / params.pow_target_spacing) as u32; // 2016
 
     // Retarget boundary
-    if next_height % interval == 0 && !params.pow_no_retargeting {
+    if next_height.is_multiple_of(interval) && !params.pow_no_retargeting {
         // Find the first block of this retarget period
         let period_start_height = next_height - interval;
         if let Some(start_hash) = header_index
@@ -923,7 +923,7 @@ fn calculate_next_bits(
         let mut scan_hash = *prev_hash;
         let mut scan_height = next_height - 1;
         loop {
-            if scan_height % interval == 0 {
+            if scan_height.is_multiple_of(interval) {
                 break; // don't walk past a retarget boundary
             }
             if let Some(stored) = header_index.get_header(&scan_hash).ok().flatten() {
@@ -2096,6 +2096,10 @@ async fn submit_mined_block(
 ) {
     let block_hash = block.block_hash();
 
+    // The block's txids, returned by connect_block (already computed there);
+    // reused below for mempool eviction.
+    let block_txids: Vec<bitcoin::Txid>;
+
     // Validate and connect the block
     if let Some(ref cs) = chain_state {
         let mut cs_guard = cs.lock().await;
@@ -2127,7 +2131,7 @@ async fn submit_mined_block(
         // rejects `header_tip - block_tip` trips the is_catching_up() gate, which
         // makes the gateway stop sending jobs — silently freezing the miner.
         match cs_guard.connect_block(&block, height) {
-            Ok(()) => {}
+            Ok(txids) => block_txids = txids,
             Err(e) => {
                 error!(
                     %addr,
@@ -2193,7 +2197,7 @@ async fn submit_mined_block(
     // calls remove_for_block), so without this the mined txs would linger and
     // the next template would re-include already-spent inputs, making every
     // subsequent block fail connect_block and stalling mining.
-    mempool.write().await.remove_for_block(&block);
+    mempool.write().await.remove_for_block(&block, &block_txids);
 
     // Index block transactions inline — BEFORE publishing NewBlock — so that
     // Electrum subscription notifications include the correct up-to-date status.

@@ -23,6 +23,7 @@ const META_HEADER_TIP_HASH: &[u8] = b"header_tip_hash";
 const META_HEADER_TIP_HEIGHT: &[u8] = b"header_tip_height";
 const META_PRUNED_HEIGHT: &[u8] = b"pruned_height";
 const META_BIP110_ABANDONED: &[u8] = b"bip110_abandoned";
+const META_BIP110_CONFIG: &[u8] = b"bip110_config";
 const META_SPLIT_RIVAL_TIPS: &[u8] = b"split_rival_tips";
 
 /// Block failed consensus validation at connect while BIP-110 was enforcing.
@@ -1051,6 +1052,50 @@ impl HeaderIndex {
         }
     }
 
+    /// Persist the effective BIP-110 enforcement-config fingerprint together
+    /// with the validated height it started covering from. Blocks validated
+    /// at heights > `covered_from` were connected under exactly this config;
+    /// blocks at or below it were validated under whatever config (if any)
+    /// was in effect earlier. Startup compares the current config against
+    /// this record and fails closed (demanding `--reindex-chainstate`) when
+    /// the current config would enforce over an uncovered range — the
+    /// blockslop.dev late-upgrade chainstate gap. WAL-flushed: the record
+    /// must never lag the validation it describes.
+    pub fn set_bip110_config_fingerprint(
+        &self,
+        fingerprint: &str,
+        covered_from: u32,
+    ) -> StorageResult<()> {
+        let cf = self.cf(CF_META)?;
+        let mut buf = Vec::with_capacity(4 + fingerprint.len());
+        buf.extend_from_slice(&covered_from.to_le_bytes());
+        buf.extend_from_slice(fingerprint.as_bytes());
+        self.db.put_cf(&cf, META_BIP110_CONFIG, buf)?;
+        self.flush_wal()?;
+        Ok(())
+    }
+
+    /// Read the persisted BIP-110 config record: `(fingerprint, covered_from)`.
+    /// `None` means the datadir predates fingerprinting (treated by startup as
+    /// "nothing covered").
+    pub fn get_bip110_config_fingerprint(&self) -> StorageResult<Option<(String, u32)>> {
+        let cf = self.cf(CF_META)?;
+        match self.db.get_cf(&cf, META_BIP110_CONFIG)? {
+            Some(data) if data.len() >= 4 => {
+                let covered_from =
+                    u32::from_le_bytes(data[..4].try_into().expect("length checked above"));
+                let fingerprint = String::from_utf8(data[4..].to_vec()).map_err(|_| {
+                    StorageError::Serialization("invalid bip110_config fingerprint".into())
+                })?;
+                Ok(Some((fingerprint, covered_from)))
+            }
+            Some(_) => Err(StorageError::Serialization(
+                "bip110_config record too short".into(),
+            )),
+            None => Ok(None),
+        }
+    }
+
     /// Persist the split monitor's tracked rival tips (opaque serialized
     /// blob) so a restart mid-split resumes with the split visible instead
     /// of waiting for the next rival header batch.
@@ -1511,5 +1556,28 @@ mod tests {
         }
         let index = HeaderIndex::open(dir.path()).unwrap();
         assert_eq!(index.get_bip110_abandoned().unwrap(), Some(1_752_537_600));
+    }
+
+    #[test]
+    fn test_bip110_config_fingerprint_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let index = HeaderIndex::open(dir.path()).unwrap();
+            assert_eq!(index.get_bip110_config_fingerprint().unwrap(), None);
+            index
+                .set_bip110_config_fingerprint("fixed:200", 957_000)
+                .unwrap();
+            assert_eq!(
+                index.get_bip110_config_fingerprint().unwrap(),
+                Some(("fixed:200".to_string(), 957_000))
+            );
+            // Overwrite with a new config.
+            index.set_bip110_config_fingerprint("off", 958_000).unwrap();
+        }
+        let index = HeaderIndex::open(dir.path()).unwrap();
+        assert_eq!(
+            index.get_bip110_config_fingerprint().unwrap(),
+            Some(("off".to_string(), 958_000))
+        );
     }
 }

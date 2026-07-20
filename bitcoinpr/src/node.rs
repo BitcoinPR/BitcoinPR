@@ -32,9 +32,12 @@ enum DrainStep {
         expected_hash: Option<bitcoin::BlockHash>,
     },
     /// Connected; the block comes back for post-connect work (mempool
-    /// removal, indexing, relay) along with the new tip.
+    /// removal, indexing, relay) along with the new tip. `txids` are the
+    /// block's txids as computed by connect_block, reused downstream instead
+    /// of re-hashing every transaction.
     Connected {
         block: bitcoin::Block,
+        txids: Vec<bitcoin::Txid>,
         connected_height: u32,
         connected_hash: bitcoin::BlockHash,
     },
@@ -453,7 +456,7 @@ pub(crate) fn spawn_scripthash_backfill(
                 sh.store(h, std::sync::atomic::Ordering::Relaxed);
             }
             backfill_count += 1;
-            if backfill_count % 1000 == 0 {
+            if backfill_count.is_multiple_of(1000) {
                 info!(
                     height = h,
                     indexed = backfill_count,
@@ -2106,7 +2109,7 @@ impl Node {
                                     Err(_) => return Ok(None),
                                 };
                             cs.connect_block_with_raw(&block, h, Some(&raw))
-                                .map(|()| Some((cs.best_height, cs.best_hash)))
+                                .map(|_txids| Some((cs.best_height, cs.best_hash)))
                                 .map_err(|e| format!("height {h}: {e}"))
                         })
                         .await
@@ -2119,7 +2122,7 @@ impl Node {
                             *shared_best_height.write().await = connected_height;
                             *shared_best_hash.write().await = connected_hash;
                             *p2p_best_height.write().unwrap() = connected_height as i32;
-                            if replayed_this_tick % 100 == 0 {
+                            if replayed_this_tick.is_multiple_of(100) {
                                 info!(
                                     height = connected_height,
                                     remaining = end_height.saturating_sub(connected_height),
@@ -2419,8 +2422,9 @@ impl Node {
                             expected_height,
                             raw_block_bytes.as_deref(),
                         ) {
-                            Ok(()) => DrainStep::Connected {
+                            Ok(txids) => DrainStep::Connected {
                                 block,
+                                txids,
                                 connected_height: cs.best_height,
                                 connected_hash: cs.best_hash,
                             },
@@ -2449,6 +2453,7 @@ impl Node {
                         }
                         DrainStep::Connected {
                             block,
+                            txids,
                             connected_height,
                             connected_hash,
                         } => {
@@ -2541,7 +2546,10 @@ impl Node {
                                 }
                             }
 
-                            shared_mempool.write().await.remove_for_block(&block);
+                            shared_mempool
+                                .write()
+                                .await
+                                .remove_for_block(&block, &txids);
 
                             // Index scripthash inline with every connected block —
                             // but NOT during IBD. Each input needs resolve_spent_output
@@ -2604,7 +2612,7 @@ impl Node {
                                 ));
                             }
 
-                            if blocks_validated % 1000 == 0 {
+                            if blocks_validated.is_multiple_of(1000) {
                                 info!(
                                     blocks_validated,
                                     height = connected_height,
@@ -3302,9 +3310,14 @@ impl Node {
                                                     .iter()
                                                     .map(|tx| tx.compute_txid())
                                                     .collect();
-                                                if let Err(e) =
-                                                    ti2.index_block_at_height(&hash, &txids, h)
-                                                {
+                                                let tx_locs =
+                                                    bitcoinpr_storage::compute_tx_locations(&block);
+                                                if let Err(e) = ti2.index_block_at_height(
+                                                    &hash,
+                                                    &txids,
+                                                    h,
+                                                    Some(&tx_locs),
+                                                ) {
                                                     tracing::warn!(height = h, error = %e, "Index catch-up: tx index error");
                                                 } else {
                                                     n += 1;

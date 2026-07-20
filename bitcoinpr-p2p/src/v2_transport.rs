@@ -526,7 +526,7 @@ impl FsChaCha20 {
     pub fn crypt(&mut self, chunk: &[u8]) -> Vec<u8> {
         let ks = self.get_keystream_bytes(chunk.len());
         let ret: Vec<u8> = ks.iter().zip(chunk.iter()).map(|(k, c)| k ^ c).collect();
-        if (self.chunk_counter + 1) % REKEY_INTERVAL == 0 {
+        if (self.chunk_counter + 1).is_multiple_of(REKEY_INTERVAL) {
             let new_key = self.get_keystream_bytes(32);
             self.key.copy_from_slice(&new_key);
             self.block_counter = 0;
@@ -585,7 +585,7 @@ impl FsChaCha20Poly1305 {
 
     /// Rekey if this message completes a 224-message epoch, then advance the counter.
     fn advance(&mut self, nonce: &[u8; 12]) {
-        if (self.packet_counter + 1) % REKEY_INTERVAL == 0 {
+        if (self.packet_counter + 1).is_multiple_of(REKEY_INTERVAL) {
             let mut rekey_nonce = [0xFFu8; 12];
             rekey_nonce[4..].copy_from_slice(&nonce[4..]);
             let out = aead_chacha20_poly1305_encrypt(&self.key, &rekey_nonce, b"", &[0u8; 32]);

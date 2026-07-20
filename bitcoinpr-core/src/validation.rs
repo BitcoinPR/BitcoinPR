@@ -266,19 +266,16 @@ pub fn check_transaction(tx: &Transaction) -> CoreResult<()> {
             .ok_or_else(|| CoreError::InvalidTransaction("bad-txns-txouttotal-toolarge".into()))?;
     }
 
-    // No duplicate inputs within the same transaction.
-    let mut seen = std::collections::HashSet::with_capacity(tx.input.len());
-    for inp in &tx.input {
-        if !seen.insert(inp.previous_output) {
-            return Err(CoreError::InvalidTransaction(
-                "bad-txns-inputs-duplicate".into(),
-            ));
-        }
-    }
-
-    // Non-coinbase inputs must reference a real prevout (not null).
-    if !tx.is_coinbase() {
-        let null = bitcoin::OutPoint::null();
+    // No duplicate inputs within the same transaction, and non-coinbase
+    // inputs must reference a real prevout (not null) — one pass for both.
+    //
+    // 70–90% of transactions have 1–2 inputs (Core #31682 analogue): skip
+    // the HashSet entirely for those (1 input: nothing to compare, 2: one
+    // compare), and use a sorted Vec for small counts — a linear/sort scan
+    // over a handful of 36-byte outpoints beats hashing each one.
+    let check_null = !tx.is_coinbase();
+    let null = bitcoin::OutPoint::null();
+    if check_null {
         for inp in &tx.input {
             if inp.previous_output == null {
                 return Err(CoreError::InvalidTransaction(
@@ -286,6 +283,30 @@ pub fn check_transaction(tx: &Transaction) -> CoreResult<()> {
                 ));
             }
         }
+    }
+
+    const SORT_SCAN_MAX: usize = 32;
+    let dup = match tx.input.len() {
+        0 | 1 => false,
+        2 => tx.input[0].previous_output == tx.input[1].previous_output,
+        n if n <= SORT_SCAN_MAX => {
+            let mut prevouts: Vec<bitcoin::OutPoint> =
+                tx.input.iter().map(|i| i.previous_output).collect();
+            prevouts.sort_unstable();
+            prevouts.windows(2).any(|w| w[0] == w[1])
+        }
+        _ => {
+            let mut seen = bitcoinpr_storage::FastHashSet::with_capacity_and_hasher(
+                tx.input.len(),
+                bitcoinpr_storage::FastOutpointBuildHasher,
+            );
+            tx.input.iter().any(|inp| !seen.insert(inp.previous_output))
+        }
+    };
+    if dup {
+        return Err(CoreError::InvalidTransaction(
+            "bad-txns-inputs-duplicate".into(),
+        ));
     }
 
     Ok(())
@@ -392,7 +413,7 @@ pub fn get_next_work_required_with(
     let interval = params.difficulty_adjustment_interval();
 
     // Not on a retarget boundary.
-    if next_height % interval != 0 {
+    if !next_height.is_multiple_of(interval) {
         if params.pow_allow_min_difficulty_blocks {
             // Testnet rule: if the candidate is >2× the target spacing after the
             // previous block, the minimum-difficulty (pow_limit) target is allowed.
@@ -606,14 +627,32 @@ pub fn validate_coinbase(block: &Block, height: u32, params: &ConsensusParams) -
 /// - witness_root is the merkle root of all wtxids (coinbase wtxid = 0x00..00)
 /// - witness_nonce is the coinbase's first witness item (32 bytes)
 pub fn validate_witness_commitment(block: &Block) -> CoreResult<()> {
-    // A block needs a witness commitment only if any transaction has witness data
-    let has_witness = block
+    if !block_has_witness(block) {
+        return Ok(()); // No witness data → no commitment needed
+    }
+    let wtxids: Vec<bitcoin::Wtxid> = block.txdata.iter().map(|tx| tx.compute_wtxid()).collect();
+    validate_witness_commitment_with_wtxids(block, &wtxids)
+}
+
+/// True when any non-coinbase transaction in the block carries witness data
+/// (i.e. the block requires a BIP 141 witness commitment).
+pub fn block_has_witness(block: &Block) -> bool {
+    block
         .txdata
         .iter()
         .skip(1)
-        .any(|tx| tx.input.iter().any(|input| !input.witness.is_empty()));
+        .any(|tx| tx.input.iter().any(|input| !input.witness.is_empty()))
+}
 
-    if !has_witness {
+/// `validate_witness_commitment` with the block's wtxids precomputed by the
+/// caller (`wtxids[i]` for `block.txdata[i]`; the coinbase entry is ignored —
+/// the commitment always uses 0x00..00 for it). Lets the connect path compute
+/// wtxids once and reuse them for sig-cache keys (Core #32487 spirit).
+pub fn validate_witness_commitment_with_wtxids(
+    block: &Block,
+    wtxids: &[bitcoin::Wtxid],
+) -> CoreResult<()> {
+    if !block_has_witness(block) {
         return Ok(()); // No witness data → no commitment needed
     }
 
@@ -650,16 +689,15 @@ pub fn validate_witness_commitment(block: &Block) -> CoreResult<()> {
     };
 
     // Compute witness root: merkle tree of wtxids, with coinbase wtxid = 0
-    let mut wtxids: Vec<[u8; 32]> = Vec::with_capacity(block.txdata.len());
-    wtxids.push([0u8; 32]); // Coinbase wtxid is always 0x00..00
+    let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(block.txdata.len());
+    leaves.push([0u8; 32]); // Coinbase wtxid is always 0x00..00
 
-    for tx in block.txdata.iter().skip(1) {
-        let wtxid = tx.compute_wtxid();
-        wtxids.push(*AsRef::<[u8; 32]>::as_ref(&wtxid));
+    for wtxid in wtxids.iter().skip(1) {
+        leaves.push(*AsRef::<[u8; 32]>::as_ref(wtxid));
     }
 
     // Build merkle tree from wtxids
-    let witness_root = crate::merkle::root(&wtxids);
+    let witness_root = crate::merkle::root(&leaves);
 
     // Compute commitment: SHA256d(witness_root || witness_nonce)
     use bitcoin::hashes::{sha256d, Hash as _};

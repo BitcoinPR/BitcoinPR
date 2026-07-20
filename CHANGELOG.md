@@ -5,6 +5,83 @@ Completed work, newest first (moved from TODO.md on 2026-07-11).
 > Note: `docs/archive/…` paths referenced below were removed from the repo
 > on 2026-07-11; retrieve those documents from git history.
 
+## Validation/IBD Performance Batch, Scripthash Resolver v2, BIP-110 Config Fingerprint (2026-07-20)
+
+Closes the IBD Performance backlog (all 8 items from the Core PR #32043
+analysis), the top two Signature Verification Throughput items, the
+scripthash-resolver byte-offset follow-up, and the substantive fix from the
+BIP-110 late-upgrade chainstate-gap audit.
+
+**Scripthash resolver: v2 `TxIndexEntry` with tx byte locations.** The
+2026-07-12 backfill was still CPU-bound on partial block scans for
+cache-missed prevouts (~5.3 s/block, ETA >1 month). Tx-index entries now
+carry `(offset, len)` of the serialized tx within its raw block (v2, 44
+bytes; block-relative so entries survive block-file migration/reindex) in a
+write-new/read-both migration with legacy 36-byte v1 entries. A v2 prevout
+resolves with one small positional read (`BlockStore::read_block_slice`) +
+one tx decode instead of decoding the block up to the tx position. The
+existing all-v1 index upgrades itself opportunistically: when a v1 entry
+forces a funding-block scan anyway, the scan records the tx locations it
+walks past (txids already known from the outpoints — no hashing) and
+batch-rewrites those entries to v2, so repeat lookups of hot funding txs go
+direct. New blocks index as v2 at connect/backfill/catch-up.
+
+**IBD performance batch** (Core tracking PR #32043 analogues):
+- `remove_for_block` early-returns against an empty mempool (Core #32827) —
+  was a full-block `compute_txid` pass under the mempool write lock per
+  connected block during IBD; the connect path now also passes its
+  precomputed txids in, killing the re-hash even when the mempool is live.
+- wtxids are computed once per block (witness-commitment check hands them to
+  script-check queueing) instead of twice (Core #32487 spirit).
+- `FastOutpointBuildHasher` (`storage/src/fast_hash.rs`, Core #30442
+  analogue): rotate-xor fold with a per-process seed instead of SipHash-1-3
+  for outpoint/txid-keyed maps — sound because those keys are SHA256d
+  output; used by the UTXO write buffer, DashMap read cache, intra-block
+  spend maps, duplicate-input check, and mempool `spent_outpoints`.
+- Single-map write buffer (Core #33602 idea): `inserts`+`deletions` merged
+  into one `FastHashMap<[u8;36], Option<UtxoEntry>>` (`None` = tombstone) —
+  one probe instead of two on every `get`/`contains`/`apply_batch`.
+- `check_transaction` small-input fast path (Core #31682 analogue): 1 input
+  no check, ≤32 inputs sorted-scan, HashSet only beyond that; null-prevout
+  check folded into the same pass.
+- Inline small-script coin storage (Core #32279/#25325 analogue):
+  `CoinScript` stores scriptPubKeys ≤36 bytes inline (covers P2WPKH 22,
+  P2SH 23, P2PKH 25, P2WSH/P2TR 34 — ~99% of outputs), heap fallback above.
+- Batched block-file I/O (Core #31551 analogue): the background writer keeps
+  a persistent file handle and coalesces same-file queued blocks into one
+  write; readers share a small cache of `Arc<File>` handles with positional
+  (`read_exact_at`) reads — no per-read open, no seek contention; handles
+  evicted on prune.
+- Chunked UTXO flush (Core #31645, inverted): giant `--dbcache` flushes
+  commit inserts + undo records in ~128 MB idempotent chunks, deletions all
+  together last, so peak memory no longer doubles the batch and a crash
+  mid-flush replays cleanly.
+
+**Signature verification** (from the libbitcoin GPU-claim analysis): one
+shared `Secp256k1<VerifyOnly>` context (`OnceLock`) replaces per-check
+construction (was fresh per candidate signature — 5× for a 3-of-5
+multisig), and one `SighashCache` per `verify_script` call is threaded
+through the interpreter to every ECDSA/taproot check for that input, so the
+segwit/taproot tx-wide midstates (`hashPrevouts`/`hashOutputs`/…) are
+computed once per input instead of once per signature tried. No
+consensus-logic change; multisig and many-output txs stop re-hashing free
+work.
+
+**BIP-110 enforcement-config fingerprint + fail-closed startup** (the
+substantive fix from the blockslop.dev late-upgrade chainstate-gap audit):
+RDTS rules run only in `connect_block`, but startup trusted the persisted
+chainstate — a config change between runs (pre-BIP110 datadir upgraded in
+place, `--bip110height` added/lowered, abandoned flag flipped) left
+already-validated blocks unchecked under the current rules. The effective
+config (fixed height / deployment params / off) is fingerprinted in
+header-index META with the validated height it covers from; on startup, a
+changed config that would enforce at or below the validated tip refuses to
+start and demands `--reindex-chainstate` (a true replay-from-genesis here).
+Turning enforcement *off* (abandonment) just re-records; pre-fingerprint
+datadirs running the unmodified network default are grandfathered (this
+lineage always enforced the default deployment, so their chainstate is
+covered). Any future un-abandon path automatically hits the same machinery.
+
 ## Split-Monitor Follow-ups: Repair-Path Fork Choice, invalidateblock/reconsiderblock, Rival Persistence (2026-07-15)
 
 Closes the three follow-ups logged with the chain-split monitor:

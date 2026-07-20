@@ -30,7 +30,7 @@ pub fn root(leaves: &[[u8; 32]]) -> [u8; 32] {
     }
     let mut level: Vec<[u8; 32]> = leaves.to_vec();
     while level.len() > 1 {
-        if level.len() % 2 != 0 {
+        if !level.len().is_multiple_of(2) {
             let last = *level.last().expect("loop guard: level is non-empty");
             level.push(last);
         }
@@ -109,12 +109,16 @@ pub fn branch(leaves: &[[u8; 32]], index: usize) -> ([u8; 32], Vec<[u8; 32]>) {
     let mut idx = index;
 
     while level.len() > 1 {
-        if level.len() % 2 != 0 {
+        if !level.len().is_multiple_of(2) {
             let last = *level.last().expect("loop guard: level is non-empty");
             level.push(last);
         }
 
-        let sibling = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+        let sibling = if idx.is_multiple_of(2) {
+            idx + 1
+        } else {
+            idx - 1
+        };
         branch.push(level[sibling]);
 
         let mut next: Vec<[u8; 32]> = Vec::with_capacity(level.len() / 2);

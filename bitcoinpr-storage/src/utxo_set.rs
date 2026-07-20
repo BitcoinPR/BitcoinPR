@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
 use crate::error::{StorageError, StorageResult};
+use crate::fast_hash::{FastHashMap, FastOutpointBuildHasher};
 
 const CF_UTXO: &str = "utxo";
 const CF_UNDO: &str = "undo";
@@ -150,10 +151,16 @@ fn insert_cost(entry: &UtxoEntry) -> usize {
 
 /// Buffered UTXO changes waiting to be flushed to disk.
 struct WriteBuffer {
-    /// Pending inserts/updates (latest value wins).
-    inserts: std::collections::HashMap<[u8; 36], UtxoEntry>,
-    /// Pending deletions.
-    deletions: std::collections::HashSet<[u8; 36]>,
+    /// Pending changes in a single map (Core #33602 idea): `Some(entry)` is
+    /// an insert/update, `None` a deletion tombstone. One map means one
+    /// probe + one hash per `get`/`contains`/`prefetch`/`apply_batch` key
+    /// instead of two against separate insert/deletion collections.
+    entries: FastHashMap<[u8; 36], Option<UtxoEntry>>,
+    /// Number of `Some` values in `entries` (kept incrementally so
+    /// `memory_stats` doesn't scan the map).
+    insert_count: usize,
+    /// Number of `None` tombstones in `entries`.
+    deletion_count: usize,
     /// Buffered undo data (block_hash -> serialized undo bytes).
     undo_buffer: Vec<([u8; 32], Vec<u8>)>,
     /// Approximate memory held by the buffer (inserts + deletions + undo data).
@@ -168,8 +175,9 @@ struct WriteBuffer {
 impl WriteBuffer {
     fn new() -> Self {
         WriteBuffer {
-            inserts: std::collections::HashMap::new(),
-            deletions: std::collections::HashSet::new(),
+            entries: FastHashMap::default(),
+            insert_count: 0,
+            deletion_count: 0,
             undo_buffer: Vec::new(),
             bytes: 0,
             blocks_since_flush: 0,
@@ -179,18 +187,58 @@ impl WriteBuffer {
     }
 
     fn is_empty(&self) -> bool {
-        self.inserts.is_empty() && self.deletions.is_empty()
+        self.entries.is_empty()
+    }
+}
+
+/// Scripts up to this length are stored inline in [`CoinScript`] (no heap
+/// allocation). Covers the overwhelming majority of scriptPubKeys: P2WPKH 22,
+/// P2SH 23, P2PKH 25, P2WSH/P2TR 34 bytes (Core #32279/#25325 analogue).
+const INLINE_SCRIPT_MAX: usize = 36;
+
+/// Script storage for cached coins: inline up to [`INLINE_SCRIPT_MAX`] bytes,
+/// heap fallback for larger scripts. Kills one heap allocation per cached
+/// coin for ~99% of outputs and packs more cache entries per GB of dbcache.
+#[derive(Debug, Clone)]
+enum CoinScript {
+    Inline {
+        len: u8,
+        buf: [u8; INLINE_SCRIPT_MAX],
+    },
+    Heap(Box<[u8]>),
+}
+
+impl CoinScript {
+    fn new(script: &[u8]) -> Self {
+        if script.len() <= INLINE_SCRIPT_MAX {
+            let mut buf = [0u8; INLINE_SCRIPT_MAX];
+            buf[..script.len()].copy_from_slice(script);
+            CoinScript::Inline {
+                len: script.len() as u8,
+                buf,
+            }
+        } else {
+            CoinScript::Heap(script.into())
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            CoinScript::Inline { len, buf } => &buf[..*len as usize],
+            CoinScript::Heap(b) => b,
+        }
     }
 }
 
 /// Memory-efficient UTXO representation for the in-memory cache.
-/// Uses Box<[u8]> instead of Vec<u8> (saves 8 bytes: no capacity field).
+/// Small scripts are stored inline (see [`CoinScript`]); large ones fall
+/// back to a Box<[u8]> (ptr + len, no capacity field).
 /// Packs height and coinbase flag into a single u32.
 #[derive(Debug, Clone)]
 struct CompactCoin {
     amount: u64,              // 8 bytes
     height_and_coinbase: u32, // 4 bytes (height << 1 | coinbase)
-    script: Box<[u8]>,        // 16 bytes (ptr + len, no capacity)
+    script: CoinScript,       // 40 bytes inline, no heap alloc for ≤36-byte scripts
 }
 
 impl CompactCoin {
@@ -198,14 +246,14 @@ impl CompactCoin {
         CompactCoin {
             amount: entry.amount,
             height_and_coinbase: (entry.height << 1) | (entry.is_coinbase as u32),
-            script: entry.script_pubkey.clone().into_boxed_slice(),
+            script: CoinScript::new(&entry.script_pubkey),
         }
     }
 
     fn to_entry(&self) -> UtxoEntry {
         UtxoEntry {
             amount: self.amount,
-            script_pubkey: self.script.to_vec(),
+            script_pubkey: self.script.as_bytes().to_vec(),
             height: self.height_and_coinbase >> 1,
             is_coinbase: (self.height_and_coinbase & 1) != 0,
         }
@@ -233,7 +281,7 @@ pub struct UtxoMemoryStats {
 /// ~75 bytes, total per-entry cost is ~135 bytes — 3.7x more entries in the same RAM.
 pub struct UtxoSet {
     db: Arc<DB>,
-    cache: DashMap<[u8; 36], CompactCoin>,
+    cache: DashMap<[u8; 36], CompactCoin, FastOutpointBuildHasher>,
     cache_capacity: usize,
     write_buffer: Mutex<WriteBuffer>,
     /// Byte budget for the write buffer; exceeding it triggers a flush.
@@ -326,7 +374,7 @@ impl UtxoSet {
         );
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
-        let cache = DashMap::with_capacity(lru_entries);
+        let cache = DashMap::with_capacity_and_hasher(lru_entries, FastOutpointBuildHasher);
         Ok(UtxoSet {
             db: Arc::new(db),
             cache,
@@ -338,7 +386,7 @@ impl UtxoSet {
 
     /// Open using an existing DB handle (for sharing with HeaderIndex).
     pub fn from_db(db: Arc<DB>) -> Self {
-        let cache = DashMap::with_capacity(DEFAULT_CACHE_SIZE);
+        let cache = DashMap::with_capacity_and_hasher(DEFAULT_CACHE_SIZE, FastOutpointBuildHasher);
         UtxoSet {
             db,
             cache,
@@ -366,11 +414,10 @@ impl UtxoSet {
                 .write_buffer
                 .lock()
                 .expect("UTXO write buffer mutex poisoned");
-            if wb.deletions.contains(&key) {
-                return Ok(None); // Deleted in buffer
-            }
-            if let Some(entry) = wb.inserts.get(&key) {
-                return Ok(Some(entry.clone()));
+            match wb.entries.get(&key) {
+                Some(None) => return Ok(None), // Deleted in buffer
+                Some(Some(entry)) => return Ok(Some(entry.clone())),
+                None => {}
             }
         }
 
@@ -401,11 +448,10 @@ impl UtxoSet {
                 .write_buffer
                 .lock()
                 .expect("UTXO write buffer mutex poisoned");
-            if wb.deletions.contains(&key) {
-                return Ok(false);
-            }
-            if wb.inserts.contains_key(&key) {
-                return Ok(true);
+            match wb.entries.get(&key) {
+                Some(None) => return Ok(false),
+                Some(Some(_)) => return Ok(true),
+                None => {}
             }
         }
 
@@ -431,7 +477,7 @@ impl UtxoSet {
                 .expect("UTXO write buffer mutex poisoned");
             for outpoint in outpoints {
                 let key = outpoint_key(outpoint);
-                if wb.deletions.contains(&key) || wb.inserts.contains_key(&key) {
+                if wb.entries.contains_key(&key) {
                     continue;
                 }
                 if self.cache.contains_key(&key) {
@@ -505,12 +551,15 @@ impl UtxoSet {
         // removal wins and X is correctly deleted.
         for (outpoint, entry) in &batch.inserts {
             let key = outpoint_key(outpoint);
-            if wb.deletions.remove(&key) {
-                // Cancel any pending deletion
-                wb.bytes = wb.bytes.saturating_sub(DELETION_COST);
-            }
-            if let Some(old) = wb.inserts.insert(key, entry.clone()) {
-                wb.bytes = wb.bytes.saturating_sub(insert_cost(&old));
+            match wb.entries.insert(key, Some(entry.clone())) {
+                Some(Some(old)) => wb.bytes = wb.bytes.saturating_sub(insert_cost(&old)),
+                Some(None) => {
+                    // Cancelled a pending deletion tombstone
+                    wb.bytes = wb.bytes.saturating_sub(DELETION_COST);
+                    wb.deletion_count -= 1;
+                    wb.insert_count += 1;
+                }
+                None => wb.insert_count += 1,
             }
             wb.bytes += insert_cost(entry);
         }
@@ -518,12 +567,19 @@ impl UtxoSet {
         // Buffer deletions (processed second so they override intra-block inserts)
         for outpoint in &batch.removals {
             let key = outpoint_key(outpoint);
-            if let Some(old) = wb.inserts.remove(&key) {
-                // Cancel any pending insert
-                wb.bytes = wb.bytes.saturating_sub(insert_cost(&old));
-            }
-            if wb.deletions.insert(key) {
-                wb.bytes += DELETION_COST;
+            match wb.entries.insert(key, None) {
+                Some(Some(old)) => {
+                    // Cancelled a pending insert
+                    wb.bytes = wb.bytes.saturating_sub(insert_cost(&old));
+                    wb.insert_count -= 1;
+                    wb.deletion_count += 1;
+                    wb.bytes += DELETION_COST;
+                }
+                Some(None) => {} // already a tombstone
+                None => {
+                    wb.deletion_count += 1;
+                    wb.bytes += DELETION_COST;
+                }
             }
         }
 
@@ -543,8 +599,8 @@ impl UtxoSet {
             "Buffered UTXO batch: {} inserts, {} removals (buffer: {} ins, {} del, {} MB, {} blocks since flush)",
             batch.inserts.len(),
             batch.removals.len(),
-            wb.inserts.len(),
-            wb.deletions.len(),
+            wb.insert_count,
+            wb.deletion_count,
             wb.bytes / (1024 * 1024),
             wb.blocks_since_flush,
         );
@@ -571,7 +627,7 @@ impl UtxoSet {
             .write_buffer
             .try_lock()
             .ok()
-            .map(|wb| (wb.bytes, wb.inserts.len(), wb.deletions.len()));
+            .map(|wb| (wb.bytes, wb.insert_count, wb.deletion_count));
 
         // Memtable bytes across all column families; the block cache is
         // shared, so read its usage once via the UTXO CF.
@@ -656,33 +712,71 @@ impl UtxoSet {
         let cf = self.cf(CF_UTXO)?;
         let cf_undo = self.cf(CF_UNDO)?;
         let cf_meta = self.cf(CF_META)?;
+
+        let ins = wb.insert_count;
+        let del = wb.deletion_count;
+        let undos = wb.undo_buffer.len();
+        let flush_h = wb.pending_flush_height;
+
+        // Chunked flush (Core #31645, inverted for RocksDB): a large --dbcache
+        // used to produce a single multi-GB WriteBatch, doubling peak memory
+        // right at the flush and stalling RocksDB. Instead, stream inserts and
+        // undo records in bounded chunks, then commit ALL deletions together
+        // with the flush height/hash in one final atomic batch.
+        //
+        // Crash safety: recovery replays blocks forward from the persisted
+        // flush height, and insert/undo writes are idempotent under that
+        // replay (reconnecting the same blocks regenerates identical puts).
+        // Deletions are NOT — a prematurely deleted coin would fail replay
+        // with a missing UTXO — so they ride in the same WriteBatch as the
+        // meta update. RocksDB's WAL is ordered: if the final batch is
+        // durable, every earlier chunk is too.
+        const CHUNK_TARGET_BYTES: usize = 128 * 1024 * 1024;
+
+        let write_start = std::time::Instant::now();
+        let mut chunks: u32 = 0;
         let mut rocks_batch = WriteBatch::default();
+        let mut batch_bytes: usize = 0;
 
-        for key in &wb.deletions {
-            rocks_batch.delete_cf(&cf, key);
+        // 1. Inserts (chunked, idempotent).
+        for (key, entry) in wb.entries.iter() {
+            if let Some(entry) = entry {
+                let val = entry.serialize();
+                batch_bytes += 36 + val.len();
+                rocks_batch.put_cf(&cf, key, val);
+                if batch_bytes >= CHUNK_TARGET_BYTES {
+                    self.db.write(std::mem::take(&mut rocks_batch))?;
+                    chunks += 1;
+                    batch_bytes = 0;
+                }
+            }
         }
-        for (key, entry) in &wb.inserts {
-            rocks_batch.put_cf(&cf, key, entry.serialize());
-        }
+
+        // 2. Undo records (chunked, idempotent — replay regenerates them).
         for (hash, data) in &wb.undo_buffer {
+            batch_bytes += 32 + data.len();
             rocks_batch.put_cf(&cf_undo, hash, data);
+            if batch_bytes >= CHUNK_TARGET_BYTES {
+                self.db.write(std::mem::take(&mut rocks_batch))?;
+                chunks += 1;
+                batch_bytes = 0;
+            }
         }
 
-        // Persist flush height/hash atomically with UTXO data
+        // 3. Deletions + flush height/hash — one atomic final batch.
+        for (key, entry) in wb.entries.iter() {
+            if entry.is_none() {
+                rocks_batch.delete_cf(&cf, key);
+            }
+        }
         if let Some(height) = wb.pending_flush_height {
             rocks_batch.put_cf(&cf_meta, b"flush_height", height.to_le_bytes());
         }
         if let Some(hash) = wb.pending_flush_hash {
             rocks_batch.put_cf(&cf_meta, b"flush_hash", hash);
         }
-
-        let ins = wb.inserts.len();
-        let del = wb.deletions.len();
-        let undos = wb.undo_buffer.len();
-        let flush_h = wb.pending_flush_height;
-
-        let write_start = std::time::Instant::now();
         self.db.write(rocks_batch)?;
+        chunks += 1;
         let write_ms = write_start.elapsed().as_millis() as u64;
 
         // Promote flushed inserts into the read cache (up to capacity) so
@@ -690,15 +784,18 @@ impl UtxoSet {
         // partially-consumed Drain clears any remainder from the map.
         {
             let cap = self.cache_capacity;
-            for (key, entry) in wb.inserts.drain() {
+            for (key, entry) in wb.entries.drain() {
                 if self.cache.len() >= cap {
                     break;
                 }
-                self.cache.insert(key, CompactCoin::new(&entry));
+                if let Some(entry) = entry {
+                    self.cache.insert(key, CompactCoin::new(&entry));
+                }
             }
         }
-        wb.inserts.clear();
-        wb.deletions.clear();
+        wb.entries.clear();
+        wb.insert_count = 0;
+        wb.deletion_count = 0;
         wb.undo_buffer.clear();
         wb.bytes = 0;
         wb.blocks_since_flush = 0;
@@ -713,6 +810,7 @@ impl UtxoSet {
             deletions = del,
             undo_blocks = undos,
             flush_height = flush_h,
+            chunks,
             write_ms,
             "UTXO flush completed"
         );
@@ -1018,7 +1116,9 @@ impl UtxoSet {
             current_hash = self.rollback_block(&current_hash)?;
             current_height -= 1;
 
-            if (current_height - target_height) % 100 == 0 && current_height > target_height {
+            if (current_height - target_height).is_multiple_of(100)
+                && current_height > target_height
+            {
                 tracing::debug!(height = current_height, "Rollback progress");
             }
         }
@@ -1176,7 +1276,8 @@ mod tests {
         utxo_set.apply_batch(&batch).unwrap();
         {
             let wb = utxo_set.write_buffer.lock().unwrap();
-            assert!(wb.inserts.is_empty());
+            assert_eq!(wb.insert_count, 0);
+            assert_eq!(wb.deletion_count, 1);
             assert_eq!(wb.bytes, DELETION_COST);
         }
 
@@ -1189,7 +1290,8 @@ mod tests {
         utxo_set.apply_batch(&batch).unwrap();
         {
             let wb = utxo_set.write_buffer.lock().unwrap();
-            assert!(wb.deletions.is_empty());
+            assert_eq!(wb.deletion_count, 0);
+            assert_eq!(wb.insert_count, 1);
             assert_eq!(wb.bytes, cost);
         }
     }
@@ -1216,7 +1318,7 @@ mod tests {
         assert!(flushed, "byte budget overflow must trigger a flush");
 
         let wb = utxo_set.write_buffer.lock().unwrap();
-        assert!(wb.inserts.is_empty());
+        assert!(wb.entries.is_empty());
         assert_eq!(wb.bytes, 0);
         assert_eq!(wb.blocks_since_flush, 0);
         drop(wb);
@@ -1239,6 +1341,33 @@ mod tests {
         assert_eq!(restored.height, 500000);
         assert!(!restored.is_coinbase);
         assert_eq!(restored.script_pubkey, entry.script_pubkey);
+    }
+
+    #[test]
+    fn coin_script_inline_and_heap_roundtrip() {
+        // At the inline boundary (36 bytes) the script stays inline; one byte
+        // over falls back to the heap. Both must round-trip byte-identically.
+        for len in [0usize, 1, 22, 25, 34, 36, 37, 100, 10_000] {
+            let script: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let cs = CoinScript::new(&script);
+            assert_eq!(cs.as_bytes(), &script[..], "len={len}");
+            assert_eq!(
+                matches!(cs, CoinScript::Inline { .. }),
+                len <= INLINE_SCRIPT_MAX,
+                "len={len}"
+            );
+            // Full CompactCoin roundtrip preserves the script.
+            let entry = UtxoEntry {
+                amount: 7,
+                script_pubkey: script.clone(),
+                height: 123,
+                is_coinbase: len % 2 == 0,
+            };
+            let restored = CompactCoin::new(&entry).to_entry();
+            assert_eq!(restored.script_pubkey, script);
+            assert_eq!(restored.height, 123);
+            assert_eq!(restored.is_coinbase, len % 2 == 0);
+        }
     }
 
     #[test]

@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, warn};
 
 use crate::error::{StorageError, StorageResult};
@@ -13,6 +14,11 @@ const MAX_BLOCK_FILE_SIZE: u64 = 128 * 1024 * 1024; // 128 MB per file
 /// the UTXO flush cadence (500 blocks) so that on a crash the worst case is
 /// re-downloading a small tail whose UTXO effects also weren't committed.
 const FSYNC_EVERY_N_WRITES: u32 = 500;
+
+/// Cap on cached read handles. Reads are heavily skewed toward a handful of
+/// hot files (scripthash backfill walks funding blocks, peers request recent
+/// blocks), so a small cache captures nearly all reopens.
+const READ_HANDLE_CACHE_MAX: usize = 8;
 
 /// Position of a block within the flat file storage.
 #[derive(Debug, Clone, Copy)]
@@ -59,6 +65,10 @@ pub struct BlockStore {
     /// falls behind the disk, senders block instead of queueing unbounded
     /// serialized blocks in memory (natural backpressure on validation).
     write_tx: Mutex<Option<std::sync::mpsc::SyncSender<WriteCmd>>>,
+    /// Cached read handles keyed by file number. Positional reads
+    /// (`read_exact_at`) need no seek state, so one shared handle per file
+    /// serves concurrent readers without reopening per read.
+    read_handles: Mutex<HashMap<u32, Arc<File>>>,
 }
 
 enum WriteCmd {
@@ -96,6 +106,7 @@ impl BlockStore {
             max_file_size,
             current_file: Mutex::new(CurrentFile { file_num, offset }),
             write_tx: Mutex::new(None),
+            read_handles: Mutex::new(HashMap::new()),
         })
     }
 
@@ -277,6 +288,12 @@ impl BlockStore {
         }
         let path = self.block_file_path(file_num);
         let size = fs::metadata(&path)?.len();
+        // Drop any cached read handle first so the open fd doesn't keep the
+        // pruned file's disk space pinned after the unlink.
+        self.read_handles
+            .lock()
+            .expect("block store read_handles mutex poisoned")
+            .remove(&file_num);
         fs::remove_file(&path)?;
         debug!("Pruned block file {:?} ({} bytes)", path, size);
         Ok(size)
@@ -345,42 +362,80 @@ impl BlockStore {
         std::thread::Builder::new()
             .name("block-writer".into())
             .spawn(move || {
-                let mut last_path: Option<PathBuf> = None;
+                // Persistent append handle for the current blk file: reopened
+                // only on rotation (path change) or after a write error, not
+                // per block. The handle doubles as the fsync target.
+                let mut open_file: Option<(PathBuf, File)> = None;
                 let mut writes_since_fsync: u32 = 0;
+                // A command pulled off the queue during coalescing that did
+                // not match the batch (rotation boundary or a Flush).
+                let mut carry: Option<WriteCmd> = None;
 
-                for cmd in rx {
+                loop {
+                    let cmd = match carry.take() {
+                        Some(c) => c,
+                        None => match rx.recv() {
+                            Ok(c) => c,
+                            Err(_) => break,
+                        },
+                    };
                     match cmd {
-                        WriteCmd::Block { path, data } => {
-                            let result = (|| -> std::io::Result<()> {
-                                let mut file =
-                                    OpenOptions::new().create(true).append(true).open(&path)?;
-                                file.write_all(&data)?;
-                                Ok(())
-                            })();
-                            if let Err(e) = result {
+                        WriteCmd::Block { path, mut data } => {
+                            // Coalesce every already-queued write for the same
+                            // file into one buffer → one write_all syscall.
+                            let mut coalesced: u32 = 1;
+                            while let Ok(next) = rx.try_recv() {
+                                match next {
+                                    WriteCmd::Block {
+                                        path: next_path,
+                                        data: next_data,
+                                    } if next_path == path => {
+                                        data.extend_from_slice(&next_data);
+                                        coalesced += 1;
+                                    }
+                                    other => {
+                                        carry = Some(other);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            let needs_open = match open_file {
+                                Some((ref p, _)) => *p != path,
+                                None => true,
+                            };
+                            if needs_open {
+                                match OpenOptions::new().create(true).append(true).open(&path) {
+                                    Ok(f) => open_file = Some((path.clone(), f)),
+                                    Err(e) => {
+                                        warn!("Background block write open failed: {}", e);
+                                        continue;
+                                    }
+                                }
+                            }
+                            let (_, file) = open_file.as_mut().expect("opened above");
+                            if let Err(e) = file.write_all(&data) {
                                 warn!("Background block write failed: {}", e);
+                                // Drop the handle so the next write reopens in
+                                // append mode at the true end of file.
+                                open_file = None;
                                 continue;
                             }
-                            writes_since_fsync += 1;
-                            last_path = Some(path.clone());
+                            writes_since_fsync += coalesced;
 
                             // Periodic fsync — keeps the durable tail within
                             // FSYNC_EVERY_N_WRITES of the current write head.
                             if writes_since_fsync >= FSYNC_EVERY_N_WRITES {
-                                if let Ok(f) = OpenOptions::new().write(true).open(&path) {
-                                    if let Err(e) = f.sync_data() {
-                                        warn!("periodic fsync failed for {:?}: {}", path, e);
-                                    }
+                                if let Err(e) = file.sync_data() {
+                                    warn!("periodic fsync failed for {:?}: {}", path, e);
                                 }
                                 writes_since_fsync = 0;
                             }
                         }
                         WriteCmd::Flush(ack) => {
-                            if let Some(ref p) = last_path {
-                                if let Ok(f) = OpenOptions::new().write(true).open(p) {
-                                    if let Err(e) = f.sync_data() {
-                                        warn!("Flush fsync failed for {:?}: {}", p, e);
-                                    }
+                            if let Some((ref p, ref f)) = open_file {
+                                if let Err(e) = f.sync_data() {
+                                    warn!("Flush fsync failed for {:?}: {}", p, e);
                                 }
                             }
                             writes_since_fsync = 0;
@@ -768,14 +823,75 @@ impl BlockStore {
         }
     }
 
-    fn read_block_at(&self, pos: &BlockPos) -> StorageResult<Vec<u8>> {
-        let path = self.block_file_path(pos.file_num);
-        let mut file = File::open(&path)?;
-        file.seek(SeekFrom::Start(pos.offset))?;
+    /// Get (or open and cache) a shared read handle for a block file.
+    fn read_handle(&self, file_num: u32) -> StorageResult<Arc<File>> {
+        let mut cache = self
+            .read_handles
+            .lock()
+            .expect("block store read_handles mutex poisoned");
+        if let Some(f) = cache.get(&file_num) {
+            return Ok(Arc::clone(f));
+        }
+        let file = Arc::new(File::open(self.block_file_path(file_num))?);
+        if cache.len() >= READ_HANDLE_CACHE_MAX {
+            // Simple bound: drop everything and refill. Reads are skewed to a
+            // few hot files, so the occasional full refill is negligible.
+            cache.clear();
+        }
+        cache.insert(file_num, Arc::clone(&file));
+        Ok(file)
+    }
 
-        // Read size header
+    /// Read a byte range from within a stored block (block-relative offset,
+    /// e.g. a single transaction located via a v2 tx-index entry). One small
+    /// positional read instead of pulling the whole block. Same
+    /// read-your-writes retry as [`read_block`](Self::read_block).
+    pub fn read_block_slice(
+        &self,
+        pos: &BlockPos,
+        offset: u32,
+        len: u32,
+    ) -> StorageResult<Vec<u8>> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| StorageError::Serialization("block slice range overflow".into()))?;
+        if end > pos.size {
+            return Err(StorageError::Serialization(format!(
+                "block slice out of range: {}..{} exceeds block size {}",
+                offset, end, pos.size
+            )));
+        }
+        match self.read_block_slice_at(pos, offset, len) {
+            Ok(data) => Ok(data),
+            Err(first_err) => {
+                if self.flush().is_ok() {
+                    if let Ok(data) = self.read_block_slice_at(pos, offset, len) {
+                        return Ok(data);
+                    }
+                }
+                Err(first_err)
+            }
+        }
+    }
+
+    fn read_block_slice_at(&self, pos: &BlockPos, offset: u32, len: u32) -> StorageResult<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+
+        let file = self.read_handle(pos.file_num)?;
+        let mut data = vec![0u8; len as usize];
+        file.read_exact_at(&mut data, pos.offset + 4 + offset as u64)?;
+        Ok(data)
+    }
+
+    fn read_block_at(&self, pos: &BlockPos) -> StorageResult<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+
+        let file = self.read_handle(pos.file_num)?;
+
+        // Read size header (positional read — no seek state, so the cached
+        // handle can serve concurrent readers).
         let mut size_buf = [0u8; 4];
-        file.read_exact(&mut size_buf)?;
+        file.read_exact_at(&mut size_buf, pos.offset)?;
         let size = u32::from_le_bytes(size_buf);
 
         if size != pos.size {
@@ -786,7 +902,7 @@ impl BlockStore {
         }
 
         let mut data = vec![0u8; size as usize];
-        file.read_exact(&mut data)?;
+        file.read_exact_at(&mut data, pos.offset + 4)?;
         Ok(data)
     }
 

@@ -1,7 +1,9 @@
 use bitcoin::consensus::encode;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::{BlockHash, OutPoint, Txid};
-use bitcoinpr_storage::{BlockStore, HeaderIndex, StorageError, StorageResult, TxIndex};
+use bitcoinpr_storage::{
+    BlockStore, HeaderIndex, StorageError, StorageResult, TxIndex, TxIndexEntry,
+};
 use lru::LruCache;
 use rocksdb::{ColumnFamilyDescriptor, IteratorMode, Options, ReadOptions, DB};
 use serde::Serialize;
@@ -39,6 +41,16 @@ const RESOLVER_MAX_THREADS: usize = 8;
 /// A prevout the resolver must recover from a funding block:
 /// (result ordinal, tx position within the funding block, output index).
 type PrevoutWant = (usize, u32, u32);
+
+/// A prevout resolvable directly through a v2 tx-index entry:
+/// (result ordinal, tx position, output index, tx byte offset, tx byte len).
+type DirectWant = (usize, u32, u32, u32, u32);
+
+/// A tx location discovered while scanning a block: (tx position, offset, len).
+type ScannedLoc = (u32, u32, u32);
+
+/// Per-block resolver work, split into direct (v2) and scan (v1) wants.
+type WantGroup = (Vec<DirectWant>, Vec<PrevoutWant>);
 
 /// A cached output: (scriptPubKey bytes, value in sats).
 type CachedOutput = (Box<[u8]>, u64);
@@ -186,41 +198,83 @@ impl ScripthashIndex {
                 unique_txids.push(op.txid);
             }
         }
-        let mut located: Vec<Option<(BlockHash, u32)>> = vec![None; unique_txids.len()];
+        let mut located: Vec<Option<TxIndexEntry>> = vec![None; unique_txids.len()];
         let chunk = unique_txids.len().div_ceil(threads).max(1);
         std::thread::scope(|s| {
             for (txids, slots) in unique_txids.chunks(chunk).zip(located.chunks_mut(chunk)) {
                 s.spawn(move || {
                     for (entry, slot) in tx_index.get_many(txids).into_iter().zip(slots.iter_mut())
                     {
-                        *slot = entry.map(|e| (e.block_hash, e.tx_pos));
+                        *slot = entry;
                     }
                 });
             }
         });
 
-        // Phase 2: group by funding block so each block is fetched once.
-        let mut groups: HashMap<BlockHash, Vec<PrevoutWant>> = HashMap::new();
+        // Phase 2: group by funding block so each block is fetched once,
+        // splitting v2 entries (known tx byte range → direct read) from v1
+        // entries (position only → block scan).
+        let mut groups: HashMap<BlockHash, WantGroup> = HashMap::new();
         for (i, op) in outpoints.iter().enumerate() {
-            if let Some((hash, tx_pos)) = located[txid_ordinal[&op.txid]] {
-                groups.entry(hash).or_default().push((i, tx_pos, op.vout));
+            if let Some(entry) = &located[txid_ordinal[&op.txid]] {
+                let group = groups.entry(entry.block_hash).or_default();
+                match entry.tx_loc {
+                    Some((offset, len)) => group.0.push((i, entry.tx_pos, op.vout, offset, len)),
+                    None => group.1.push((i, entry.tx_pos, op.vout)),
+                }
             }
         }
 
-        // Phase 3: parallel block read + partial decode + output extraction.
-        let groups: Vec<(BlockHash, Vec<PrevoutWant>)> = groups.into_iter().collect();
+        // Phase 3: parallel output extraction. v2 wants are one small
+        // positional read + tx decode each; v1 wants read + partially scan
+        // the whole block, and report the tx locations the scan discovers so
+        // the v1 entries can be upgraded (write-new/read-both migration).
+        type WorkerOut = (Vec<ResolvedPrevout>, Vec<(Txid, TxIndexEntry)>);
+        let groups: Vec<(BlockHash, WantGroup)> = groups.into_iter().collect();
         let bucket = groups.len().div_ceil(threads).max(1);
-        let resolved: Vec<Vec<ResolvedPrevout>> = std::thread::scope(|s| {
+        let worker_out: Vec<WorkerOut> = std::thread::scope(|s| {
             let handles: Vec<_> = groups
                 .chunks(bucket)
                 .map(|bucket_groups| {
                     s.spawn(move || {
                         let mut out = Vec::new();
-                        for (hash, wants) in bucket_groups {
+                        let mut upgrades: Vec<(Txid, TxIndexEntry)> = Vec::new();
+                        for (hash, (direct, scan)) in bucket_groups {
                             let Ok(Some(pos)) = header_index.get_block_pos(hash) else {
                                 debug!(%hash, "Prevout resolver: no block position");
                                 continue;
                             };
+                            let mut scan_wants: Vec<PrevoutWant> = scan.clone();
+                            for &(i, tx_pos, vout, offset, len) in direct {
+                                let tx = block_store
+                                    .read_block_slice(&pos, offset, len)
+                                    .ok()
+                                    .and_then(|raw| {
+                                        encode::deserialize::<bitcoin::Transaction>(&raw).ok()
+                                    });
+                                match tx {
+                                    Some(tx) => {
+                                        if let Some(o) = tx.output.get(vout as usize) {
+                                            out.push((
+                                                i,
+                                                (
+                                                    o.script_pubkey.as_bytes().to_vec(),
+                                                    o.value.to_sat(),
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                    None => {
+                                        // Bad/stale location — fall back to a
+                                        // scan, which also rewrites the entry.
+                                        warn!(%hash, tx_pos, "Prevout resolver: v2 tx read failed, falling back to block scan");
+                                        scan_wants.push((i, tx_pos, vout));
+                                    }
+                                }
+                            }
+                            if scan_wants.is_empty() {
+                                continue;
+                            }
                             let raw = match block_store.read_block(&pos) {
                                 Ok(raw) => raw,
                                 Err(e) => {
@@ -228,9 +282,36 @@ impl ScripthashIndex {
                                     continue;
                                 }
                             };
-                            Self::extract_outputs_from_raw_block(&raw, hash, wants, &mut out);
+                            let mut locs: Vec<ScannedLoc> = Vec::new();
+                            Self::extract_outputs_from_raw_block(
+                                &raw,
+                                hash,
+                                &scan_wants,
+                                &mut out,
+                                &mut locs,
+                            );
+                            if !locs.is_empty() {
+                                // The wanted txids are already known from the
+                                // outpoints — upgrading costs no hashing.
+                                let mut txid_by_pos: HashMap<u32, Txid> = HashMap::new();
+                                for &(i, tx_pos, _) in &scan_wants {
+                                    txid_by_pos.entry(tx_pos).or_insert(outpoints[i].txid);
+                                }
+                                for (tx_pos, offset, len) in locs {
+                                    if let Some(txid) = txid_by_pos.get(&tx_pos) {
+                                        upgrades.push((
+                                            *txid,
+                                            TxIndexEntry {
+                                                block_hash: *hash,
+                                                tx_pos,
+                                                tx_loc: Some((offset, len)),
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
                         }
-                        out
+                        (out, upgrades)
                     })
                 })
                 .collect();
@@ -239,22 +320,33 @@ impl ScripthashIndex {
                 .map(|h| h.join().expect("prevout resolver worker panicked"))
                 .collect()
         });
-        for worker in resolved {
-            for (i, value) in worker {
+        let mut all_upgrades: Vec<(Txid, TxIndexEntry)> = Vec::new();
+        for (resolved, upgrades) in worker_out {
+            for (i, value) in resolved {
                 results[i] = Some(value);
             }
+            all_upgrades.extend(upgrades);
+        }
+        // Opportunistic v1→v2 upgrade: the block scans discovered these
+        // locations anyway; persisting them makes future lookups of the same
+        // txs a direct read. Failure is non-fatal (entries stay v1).
+        if let Err(e) = tx_index.upgrade_tx_locations(&all_upgrades) {
+            debug!(error = %e, "Prevout resolver: tx-loc upgrade write failed");
         }
         results
     }
 
     /// Decode transactions from a raw block only as far as the highest
     /// requested tx position and pull out the wanted outputs. Avoids
-    /// materializing the whole block for a handful of prevouts.
+    /// materializing the whole block for a handful of prevouts. Records the
+    /// byte location of each wanted transaction in `locs` so the caller can
+    /// upgrade v1 tx-index entries to v2.
     fn extract_outputs_from_raw_block(
         raw: &[u8],
         hash: &BlockHash,
         wants: &[PrevoutWant],
         out: &mut Vec<ResolvedPrevout>,
+        locs: &mut Vec<ScannedLoc>,
     ) {
         let Some(max_pos) = wants.iter().map(|&(_, tx_pos, _)| tx_pos).max() else {
             return;
@@ -278,6 +370,7 @@ impl ScripthashIndex {
 
         let last = (u64::from(max_pos) + 1).min(count.0);
         for pos in 0..last {
+            let tx_start = offset;
             let Some(slice) = raw.get(offset..) else {
                 warn!(%hash, tx_pos = pos, "Prevout resolver: truncated block");
                 return;
@@ -288,6 +381,7 @@ impl ScripthashIndex {
             };
             offset += used;
             if let Some(wanted) = by_pos.get(&(pos as u32)) {
+                locs.push((pos as u32, tx_start as u32, used as u32));
                 for &(i, vout) in wanted {
                     if let Some(o) = tx.output.get(vout as usize) {
                         out.push((i, (o.script_pubkey.as_bytes().to_vec(), o.value.to_sat())));
@@ -776,7 +870,12 @@ mod tests {
             .set_block_pos(&block1.block_hash(), &pos1)
             .unwrap();
         tx_index
-            .index_block_at_height(&block1.block_hash(), &[txid1], 1)
+            .index_block_at_height(
+                &block1.block_hash(),
+                &[txid1],
+                1,
+                Some(&bitcoinpr_storage::compute_tx_locations(&block1)),
+            )
             .unwrap();
         idx.index_block_transactions(&block1, 1).unwrap();
 
@@ -831,9 +930,10 @@ mod tests {
         let spk_b = ScriptBuf::from(vec![0x52]); // recipient of the spend
         let spk_c = ScriptBuf::from(vec![0x53]); // coinbase output
 
-        // Block 1: coinbase (tx_pos 0) plus a second tx paying spk_a (tx_pos 1).
+        // Block 1: coinbase (tx_pos 0) plus a second tx paying spk_a twice
+        // (tx_pos 1). Indexed WITHOUT byte locations (legacy v1 entries).
         let tx0 = mk_tx(vec![(5000, spk_c.clone())], vec![]);
-        let tx1 = mk_tx(vec![(700, spk_a.clone())], vec![]);
+        let tx1 = mk_tx(vec![(700, spk_a.clone()), (300, spk_a.clone())], vec![]);
         let txid0 = tx0.compute_txid();
         let txid1 = tx1.compute_txid();
         let block1 = Block {
@@ -847,14 +947,16 @@ mod tests {
             .set_block_pos(&block1.block_hash(), &pos1)
             .unwrap();
         tx_index
-            .index_block_at_height(&block1.block_hash(), &[txid0, txid1], 1)
+            .index_block_at_height(&block1.block_hash(), &[txid0, txid1], 1, None)
             .unwrap();
         idx.index_block_transactions(&block1, 1).unwrap();
 
         // Simulate a restart: the outpoint cache is gone.
         idx.clear_resolver_cache();
 
-        // Block 2: spend spk_a's output (txid1:0), paying spk_b.
+        // Block 2: spend spk_a's first output (txid1:0), paying spk_b.
+        // Resolves via block scan (v1 entry), which must also upgrade the
+        // entry to v2 with the discovered byte location.
         let tx2 = mk_tx(
             vec![(700, spk_b.clone())],
             vec![OutPoint {
@@ -868,14 +970,42 @@ mod tests {
         };
         idx.index_block_transactions(&block2, 2).unwrap();
 
+        let upgraded = tx_index.get(&txid1).unwrap().unwrap();
+        assert!(
+            upgraded.tx_loc.is_some(),
+            "block scan must opportunistically upgrade the v1 entry to v2"
+        );
+        assert_eq!(upgraded.tx_pos, 1);
+
+        // Block 3: cold cache again; spend spk_a's second output (txid1:1).
+        // Now resolves via the upgraded v2 entry (direct tx read).
+        idx.clear_resolver_cache();
+        let tx3 = mk_tx(
+            vec![(300, spk_b.clone())],
+            vec![OutPoint {
+                txid: txid1,
+                vout: 1,
+            }],
+        );
+        let block3 = Block {
+            header: dummy_header(),
+            txdata: vec![tx3],
+        };
+        idx.index_block_transactions(&block3, 3).unwrap();
+
         let sh_a = ScripthashIndex::compute_scripthash(spk_a.as_bytes());
         let sh_b = ScripthashIndex::compute_scripthash(spk_b.as_bytes());
 
         let hist_a = idx.get_tx_history(&sh_a).unwrap();
-        assert_eq!(hist_a.len(), 2, "spend must appear in funder's history");
+        assert_eq!(
+            hist_a.len(),
+            3,
+            "both spends must appear in funder's history"
+        );
         assert_eq!(hist_a[1].height, 2);
+        assert_eq!(hist_a[2].height, 3);
         assert_eq!(idx.get_balance(&sh_a).unwrap().confirmed, 0);
-        assert_eq!(idx.get_balance(&sh_b).unwrap().confirmed, 700);
+        assert_eq!(idx.get_balance(&sh_b).unwrap().confirmed, 1000);
     }
 
     /// Without a resolver configured, a cross-block spend cannot be attributed

@@ -6,9 +6,19 @@ use bitcoin::sighash::{Annex, Prevouts, SighashCache, TapSighash, TapSighashType
 use bitcoin::taproot::{ControlBlock, LeafVersion, TapLeafHash};
 use bitcoin::{EcdsaSighashType, Script, ScriptBuf, Transaction, TxOut};
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::error::{CoreError, CoreResult};
+
+/// Long-lived secp256k1 verification context shared by every signature check.
+///
+/// `Secp256k1::verification_only()` allocates and randomizes a fresh context;
+/// constructing one per signature check (up to 5x for a 3-of-5 multisig input)
+/// is pure overhead. Core and libbitcoin both use a single static context.
+fn secp_ctx() -> &'static Secp256k1<secp256k1::VerifyOnly> {
+    static CTX: OnceLock<Secp256k1<secp256k1::VerifyOnly>> = OnceLock::new();
+    CTX.get_or_init(Secp256k1::verification_only)
+}
 
 /// Cache of verified script results to avoid redundant verification.
 ///
@@ -434,6 +444,12 @@ pub fn verify_script(
     // at/after the activation height (the caller encodes that in the flag).
     let bip110 = flags.verify_bip110;
 
+    // One sighash cache per input check: every signature verification for this
+    // input reuses the memoized midstate hashes (BIP 143/341 sha_prevouts,
+    // sha_sequences, sha_outputs), instead of rebuilding the cache per signature
+    // (a large win for multisig inputs).
+    let mut sighash_cache = SighashCache::new(tx);
+
     // Check for witness program (SegWit)
     if flags.verify_witness {
         if let Some((version, program)) = parse_witness_program(script_pubkey) {
@@ -443,10 +459,26 @@ pub fn verify_script(
                 return Err(CoreError::InvalidScript("witness malleated".into()));
             }
             if version == 0 {
-                return verify_witness_v0(tx, input_index, amount, program, witness, bip110);
+                return verify_witness_v0(
+                    tx,
+                    input_index,
+                    amount,
+                    program,
+                    witness,
+                    bip110,
+                    &mut sighash_cache,
+                );
             }
             if version == 1 && flags.verify_taproot && program.len() == 32 {
-                return verify_witness_v1(tx, input_index, all_prevouts, program, witness, bip110);
+                return verify_witness_v1(
+                    tx,
+                    input_index,
+                    all_prevouts,
+                    program,
+                    witness,
+                    bip110,
+                    &mut sighash_cache,
+                );
             }
             // Unknown witness versions or non-standard program lengths are
             // treated as anyone-can-spend for forward compat (BIP 141/341) —
@@ -474,7 +506,15 @@ pub fn verify_script(
 
     // Execute scriptSig to produce the initial stack
     let mut stack = Vec::new();
-    execute_script(script_sig, &mut stack, tx, input_index, amount, sig_flags)?;
+    execute_script(
+        script_sig,
+        &mut stack,
+        tx,
+        input_index,
+        amount,
+        sig_flags,
+        &mut sighash_cache,
+    )?;
 
     // Save stack for P2SH evaluation
     let stack_copy = if is_p2sh_spend {
@@ -484,7 +524,15 @@ pub fn verify_script(
     };
 
     // Execute scriptPubKey with the stack from scriptSig
-    execute_script(script_pubkey, &mut stack, tx, input_index, amount, flags)?;
+    execute_script(
+        script_pubkey,
+        &mut stack,
+        tx,
+        input_index,
+        amount,
+        flags,
+        &mut sighash_cache,
+    )?;
 
     // Check final stack
     if stack.is_empty() || !cast_to_bool(&stack[stack.len() - 1]) {
@@ -518,6 +566,7 @@ pub fn verify_script(
                             program,
                             witness,
                             bip110,
+                            &mut sighash_cache,
                         );
                     }
                     // BIP-110 rule 3: spending an undefined witness version
@@ -538,6 +587,7 @@ pub fn verify_script(
                 input_index,
                 amount,
                 flags,
+                &mut sighash_cache,
             )?;
 
             if p2sh_stack.is_empty() || !cast_to_bool(&p2sh_stack[p2sh_stack.len() - 1]) {
@@ -559,6 +609,7 @@ pub fn verify_script(
 }
 
 /// Verify a SegWit v0 witness program.
+#[allow(clippy::too_many_arguments)]
 fn verify_witness_v0(
     tx: &Transaction,
     input_index: usize,
@@ -566,6 +617,7 @@ fn verify_witness_v0(
     program: &[u8],
     witness: &bitcoin::Witness,
     enforce_bip110: bool,
+    sighash_cache: &mut SighashCache<&Transaction>,
 ) -> CoreResult<()> {
     match program.len() {
         20 => {
@@ -593,7 +645,7 @@ fn verify_witness_v0(
             }
 
             // Verify signature using BIP 143 sighash
-            verify_ecdsa_signature(tx, input_index, amount, sig, pubkey)?;
+            verify_ecdsa_signature(input_index, amount, sig, pubkey, sighash_cache)?;
 
             Ok(())
         }
@@ -631,7 +683,15 @@ fn verify_witness_v0(
             // limited to 256 bytes (the witness script itself is exempt above).
             let mut flags = ScriptFlags::all();
             flags.verify_bip110 = enforce_bip110;
-            execute_script_segwit(witness_script, &mut stack, tx, input_index, amount, flags)?;
+            execute_script_segwit(
+                witness_script,
+                &mut stack,
+                tx,
+                input_index,
+                amount,
+                flags,
+                sighash_cache,
+            )?;
 
             if stack.is_empty() || !cast_to_bool(&stack[stack.len() - 1]) {
                 return Err(CoreError::InvalidScript(
@@ -653,6 +713,7 @@ fn verify_witness_v0(
 /// Two spending paths:
 /// 1. Key path: witness = [signature] — verify Schnorr signature against output key
 /// 2. Script path: witness = [..stack, script, control_block] — verify merkle proof + execute tapscript
+#[allow(clippy::too_many_arguments)]
 fn verify_witness_v1(
     tx: &Transaction,
     input_index: usize,
@@ -660,6 +721,7 @@ fn verify_witness_v1(
     program: &[u8],
     witness: &bitcoin::Witness,
     enforce_bip110: bool,
+    sighash_cache: &mut SighashCache<&Transaction>,
 ) -> CoreResult<()> {
     debug_assert_eq!(
         program.len(),
@@ -706,12 +768,12 @@ fn verify_witness_v1(
             bip110_check_witness_items(std::iter::once(witness[0].as_ref()))?;
         }
         verify_taproot_key_spend(
-            tx,
             input_index,
             all_prevouts,
             &output_key,
             &witness[0],
             annex,
+            sighash_cache,
         )
     } else {
         // Script path spend: witness = [..stack, script, control_block]
@@ -733,8 +795,8 @@ fn verify_witness_v1(
 
         // Verify the taproot merkle proof
         let tap_script = ScriptBuf::from_bytes(script_bytes.to_vec());
-        let secp = Secp256k1::verification_only();
-        if !control_block.verify_taproot_commitment(&secp, output_key, &tap_script) {
+        let secp = secp_ctx();
+        if !control_block.verify_taproot_commitment(secp, output_key, &tap_script) {
             return Err(CoreError::InvalidScript(
                 "Taproot script path merkle proof verification failed".into(),
             ));
@@ -767,6 +829,7 @@ fn verify_witness_v1(
                 tap_leaf,
                 annex.as_ref(),
                 enforce_bip110,
+                sighash_cache,
             )?;
 
             if stack.is_empty() || !cast_to_bool(&stack[stack.len() - 1]) {
@@ -790,18 +853,20 @@ fn verify_witness_v1(
 }
 
 /// Verify a Taproot key-path spend (BIP 340 Schnorr signature).
+/// The transaction is carried by `sighash_cache` (created once per input check
+/// in `verify_script`).
+#[allow(clippy::too_many_arguments)]
 fn verify_taproot_key_spend(
-    tx: &Transaction,
     input_index: usize,
     all_prevouts: &[TxOut],
     output_key: &XOnlyPublicKey,
     sig_bytes: &[u8],
     annex: Option<Annex>,
+    sighash_cache: &mut SighashCache<&Transaction>,
 ) -> CoreResult<()> {
     let (sig, sighash_type) = parse_schnorr_sig(sig_bytes)?;
 
-    let secp = Secp256k1::verification_only();
-    let mut sighash_cache = SighashCache::new(tx);
+    let secp = secp_ctx();
 
     let prevouts = Prevouts::All(all_prevouts);
 
@@ -833,7 +898,6 @@ fn verify_taproot_key_spend(
 /// `0xFFFFFFFF` if none was executed (BIP 342).
 #[allow(clippy::too_many_arguments)]
 fn verify_taproot_script_sig(
-    tx: &Transaction,
     input_index: usize,
     all_prevouts: &[TxOut],
     pubkey: &XOnlyPublicKey,
@@ -841,11 +905,11 @@ fn verify_taproot_script_sig(
     tap_leaf: TapLeafHash,
     codesep_pos: u32,
     annex: Option<Annex>,
+    sighash_cache: &mut SighashCache<&Transaction>,
 ) -> CoreResult<()> {
     let (sig, sighash_type) = parse_schnorr_sig(sig_bytes)?;
 
-    let secp = Secp256k1::verification_only();
-    let mut sighash_cache = SighashCache::new(tx);
+    let secp = secp_ctx();
 
     let prevouts = Prevouts::All(all_prevouts);
 
@@ -938,18 +1002,19 @@ fn is_p2sh(script: &Script) -> bool {
 }
 
 /// Verify an ECDSA signature for a transaction input.
+/// The transaction is carried by `sighash_cache`.
 fn verify_ecdsa_signature(
-    tx: &Transaction,
     input_index: usize,
     amount: bitcoin::Amount,
     sig_bytes: &[u8],
     pubkey_bytes: &[u8],
+    sighash_cache: &mut SighashCache<&Transaction>,
 ) -> CoreResult<()> {
     if sig_bytes.is_empty() {
         return Err(CoreError::InvalidScript("empty signature".into()));
     }
 
-    let secp = Secp256k1::verification_only();
+    let secp = secp_ctx();
 
     let pubkey = PublicKey::from_slice(pubkey_bytes)
         .map_err(|e| CoreError::InvalidScript(format!("invalid pubkey: {e}")))?;
@@ -964,7 +1029,6 @@ fn verify_ecdsa_signature(
         .map_err(|e| CoreError::InvalidScript(format!("invalid DER signature: {e}")))?;
 
     // Compute BIP 143 sighash for SegWit
-    let mut sighash_cache = SighashCache::new(tx);
     let sighash = sighash_cache
         .p2wpkh_signature_hash(
             input_index,
@@ -1097,6 +1161,7 @@ pub fn witness_sigop_cost(
     0
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_script(
     script: &Script,
     stack: &mut Vec<Vec<u8>>,
@@ -1104,12 +1169,23 @@ fn execute_script(
     input_index: usize,
     amount: bitcoin::Amount,
     flags: ScriptFlags,
+    sighash_cache: &mut SighashCache<&Transaction>,
 ) -> CoreResult<()> {
-    execute_script_inner(script, stack, tx, input_index, amount, flags, false)
+    execute_script_inner(
+        script,
+        stack,
+        tx,
+        input_index,
+        amount,
+        flags,
+        false,
+        sighash_cache,
+    )
 }
 
 /// Like `execute_script`, but with a `segwit` flag indicating that OP_CHECKSIG
 /// should use the BIP 143 segwit v0 sighash instead of the legacy sighash.
+#[allow(clippy::too_many_arguments)]
 fn execute_script_segwit(
     script: &Script,
     stack: &mut Vec<Vec<u8>>,
@@ -1117,8 +1193,18 @@ fn execute_script_segwit(
     input_index: usize,
     amount: bitcoin::Amount,
     flags: ScriptFlags,
+    sighash_cache: &mut SighashCache<&Transaction>,
 ) -> CoreResult<()> {
-    execute_script_inner(script, stack, tx, input_index, amount, flags, true)
+    execute_script_inner(
+        script,
+        stack,
+        tx,
+        input_index,
+        amount,
+        flags,
+        true,
+        sighash_cache,
+    )
 }
 
 // ── M5 (2026-07-02 review): CONSENSUS DUPLICATION WARNING ──────────────────
@@ -1128,6 +1214,7 @@ fn execute_script_segwit(
 // as consensus-critical surgery — until then, ANY fix to a shared opcode MUST
 // be applied to BOTH interpreters, gated on the Core vector corpus
 // (core_vectors.rs), the bitcoinconsensus differential test, and fuzz_script.
+#[allow(clippy::too_many_arguments)]
 fn execute_script_inner(
     script: &Script,
     stack: &mut Vec<Vec<u8>>,
@@ -1136,6 +1223,7 @@ fn execute_script_inner(
     amount: bitcoin::Amount,
     flags: ScriptFlags,
     segwit: bool,
+    sighash_cache: &mut SighashCache<&Transaction>,
 ) -> CoreResult<()> {
     let script_bytes = script.as_bytes();
     // Legacy / SegWit v0 scripts over 10,000 bytes are invalid (Core's
@@ -1670,7 +1758,6 @@ fn execute_script_inner(
                             .as_deref()
                             .unwrap_or(&script_bytes[codesep_pos..]);
                         let result = check_sig(
-                            tx,
                             input_index,
                             amount,
                             &sig_data,
@@ -1678,6 +1765,7 @@ fn execute_script_inner(
                             Script::from_bytes(sc),
                             flags,
                             segwit,
+                            sighash_cache,
                         );
                         stack.push(if result { vec![1] } else { vec![] });
                     }
@@ -1697,7 +1785,6 @@ fn execute_script_inner(
                             .as_deref()
                             .unwrap_or(&script_bytes[codesep_pos..]);
                         if !check_sig(
-                            tx,
                             input_index,
                             amount,
                             &sig_data,
@@ -1705,6 +1792,7 @@ fn execute_script_inner(
                             Script::from_bytes(sc),
                             flags,
                             segwit,
+                            sighash_cache,
                         ) {
                             return Err(CoreError::InvalidScript(
                                 "OP_CHECKSIGVERIFY failed".into(),
@@ -1773,7 +1861,6 @@ fn execute_script_inner(
                                     .unwrap_or(&script_bytes[codesep_pos..]);
                                 let script_code = Script::from_bytes(sc);
                                 if check_sig(
-                                    tx,
                                     input_index,
                                     amount,
                                     sig,
@@ -1781,6 +1868,7 @@ fn execute_script_inner(
                                     script_code,
                                     flags,
                                     segwit,
+                                    sighash_cache,
                                 ) {
                                     matched = true;
                                     key_idx += 1;
@@ -1853,7 +1941,6 @@ fn execute_script_inner(
                                     .unwrap_or(&script_bytes[codesep_pos..]);
                                 let script_code = Script::from_bytes(sc);
                                 if check_sig(
-                                    tx,
                                     input_index,
                                     amount,
                                     sig,
@@ -1861,6 +1948,7 @@ fn execute_script_inner(
                                     script_code,
                                     flags,
                                     segwit,
+                                    sighash_cache,
                                 ) {
                                     matched = true;
                                     key_idx += 1;
@@ -2031,6 +2119,7 @@ fn execute_tapscript(
     tap_leaf: TapLeafHash,
     annex: Option<&Annex>,
     enforce_bip110: bool,
+    sighash_cache: &mut SighashCache<&Transaction>,
 ) -> CoreResult<()> {
     // BIP-110 structural pre-scan over the whole Tapleaf script (rules apply even
     // to unexecuted opcodes): rule 6 rejects any OP_SUCCESS* opcode, and rule 2
@@ -2189,7 +2278,6 @@ fn execute_tapscript(
                                 // 32-byte key: actual Schnorr verification
                                 // BIP 342: non-empty sig that fails = immediate script failure
                                 if tapscript_check_sig(
-                                    tx,
                                     input_index,
                                     all_prevouts,
                                     &sig_data,
@@ -2197,6 +2285,7 @@ fn execute_tapscript(
                                     tap_leaf,
                                     codesep_pos,
                                     annex.cloned(),
+                                    sighash_cache,
                                 ) {
                                     stack.push(vec![1]);
                                 } else {
@@ -2235,7 +2324,6 @@ fn execute_tapscript(
                             } else {
                                 // 32-byte key: actual Schnorr verification
                                 if !tapscript_check_sig(
-                                    tx,
                                     input_index,
                                     all_prevouts,
                                     &sig_data,
@@ -2243,6 +2331,7 @@ fn execute_tapscript(
                                     tap_leaf,
                                     codesep_pos,
                                     annex.cloned(),
+                                    sighash_cache,
                                 ) {
                                     return Err(CoreError::InvalidScript(
                                         "OP_CHECKSIGVERIFY failed in tapscript".into(),
@@ -2286,7 +2375,6 @@ fn execute_tapscript(
                             } else {
                                 // 32-byte key: actual Schnorr verification
                                 if tapscript_check_sig(
-                                    tx,
                                     input_index,
                                     all_prevouts,
                                     &sig_data,
@@ -2294,6 +2382,7 @@ fn execute_tapscript(
                                     tap_leaf,
                                     codesep_pos,
                                     annex.cloned(),
+                                    sighash_cache,
                                 ) {
                                     stack.push(encode_num(n + 1));
                                 } else {
@@ -2906,7 +2995,6 @@ fn is_tapscript_success_opcode(op: u8) -> bool {
 /// Caller must ensure sig_data is non-empty and pubkey_data is 32 bytes.
 #[allow(clippy::too_many_arguments)]
 fn tapscript_check_sig(
-    tx: &Transaction,
     input_index: usize,
     all_prevouts: &[TxOut],
     sig_data: &[u8],
@@ -2914,6 +3002,7 @@ fn tapscript_check_sig(
     tap_leaf: TapLeafHash,
     codesep_pos: u32,
     annex: Option<Annex>,
+    sighash_cache: &mut SighashCache<&Transaction>,
 ) -> bool {
     if sig_data.is_empty() || pubkey_data.len() != 32 {
         return false;
@@ -2925,7 +3014,6 @@ fn tapscript_check_sig(
     };
 
     verify_taproot_script_sig(
-        tx,
         input_index,
         all_prevouts,
         &pubkey,
@@ -2933,14 +3021,16 @@ fn tapscript_check_sig(
         tap_leaf,
         codesep_pos,
         annex,
+        sighash_cache,
     )
     .is_ok()
 }
 
 /// Check a signature against a public key for a transaction input.
+/// The transaction is carried by `sighash_cache` (one per input check, so the
+/// memoized BIP 143 midstates are shared across every signature in the input).
 #[allow(clippy::too_many_arguments)]
 fn check_sig(
-    tx: &Transaction,
     input_index: usize,
     amount: bitcoin::Amount,
     sig_data: &[u8],
@@ -2948,12 +3038,13 @@ fn check_sig(
     script_code: &Script,
     flags: ScriptFlags,
     segwit: bool,
+    sighash_cache: &mut SighashCache<&Transaction>,
 ) -> bool {
     if sig_data.is_empty() || pubkey_data.is_empty() {
         return false;
     }
 
-    let secp = Secp256k1::verification_only();
+    let secp = secp_ctx();
 
     let pubkey = match PublicKey::from_slice(pubkey_data) {
         Ok(pk) => pk,
@@ -2981,8 +3072,6 @@ fn check_sig(
     signature.normalize_s();
 
     let sighash_type = EcdsaSighashType::from_consensus(sighash_type_byte as u32);
-
-    let mut sighash_cache = SighashCache::new(tx);
 
     if segwit {
         // BIP 143: segwit v0 sighash
@@ -3358,10 +3447,11 @@ mod tests {
             &mut stack,
             &tx,
             0,
-            &[prev_output.clone()],
+            std::slice::from_ref(&prev_output),
             tap_leaf,
             None,
             false,
+            &mut SighashCache::new(&tx),
         );
         assert!(result.is_err());
         assert!(result
@@ -3393,10 +3483,11 @@ mod tests {
             &mut stack,
             &tx,
             0,
-            &[prev_output.clone()],
+            std::slice::from_ref(&prev_output),
             tap_leaf,
             None,
             false,
+            &mut SighashCache::new(&tx),
         );
         assert!(result.is_ok());
     }
@@ -3587,13 +3678,32 @@ mod tests {
         // OP_SUCCESS (0xc0) alone: succeeds when not enforcing, rejected when enforcing.
         let script = ScriptBuf::from_bytes(vec![0xc0]);
         let mut s1 = vec![];
-        assert!(
-            execute_tapscript(&script, &mut s1, &tx, 0, &[prev.clone()], leaf, None, false).is_ok()
-        );
+        assert!(execute_tapscript(
+            &script,
+            &mut s1,
+            &tx,
+            0,
+            std::slice::from_ref(&prev),
+            leaf,
+            None,
+            false,
+            &mut SighashCache::new(&tx)
+        )
+        .is_ok());
         let mut s2 = vec![];
-        let err = execute_tapscript(&script, &mut s2, &tx, 0, &[prev.clone()], leaf, None, true)
-            .unwrap_err()
-            .to_string();
+        let err = execute_tapscript(
+            &script,
+            &mut s2,
+            &tx,
+            0,
+            std::slice::from_ref(&prev),
+            leaf,
+            None,
+            true,
+            &mut SighashCache::new(&tx),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("OP_SUCCESS"), "got: {err}");
     }
 
@@ -3605,11 +3715,31 @@ mod tests {
         let mut s1 = vec![];
         // Not enforcing: the IF executes normally (script ends with empty stack →
         // evaluation handled by caller; here we only check it doesn't error out).
-        let _ = execute_tapscript(&script, &mut s1, &tx, 0, &[prev.clone()], leaf, None, false);
+        let _ = execute_tapscript(
+            &script,
+            &mut s1,
+            &tx,
+            0,
+            std::slice::from_ref(&prev),
+            leaf,
+            None,
+            false,
+            &mut SighashCache::new(&tx),
+        );
         let mut s2 = vec![];
-        let err = execute_tapscript(&script, &mut s2, &tx, 0, &[prev.clone()], leaf, None, true)
-            .unwrap_err()
-            .to_string();
+        let err = execute_tapscript(
+            &script,
+            &mut s2,
+            &tx,
+            0,
+            std::slice::from_ref(&prev),
+            leaf,
+            None,
+            true,
+            &mut SighashCache::new(&tx),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("OP_IF/OP_NOTIF"), "got: {err}");
     }
 
@@ -3700,9 +3830,19 @@ mod tests {
         let mut script = ScriptBuf::new();
         script.push_slice(bitcoin::script::PushBytesBuf::try_from(vec![0u8; 300]).unwrap());
         let mut s = vec![];
-        let err = execute_tapscript(&script, &mut s, &tx, 0, &[prev.clone()], leaf, None, true)
-            .unwrap_err()
-            .to_string();
+        let err = execute_tapscript(
+            &script,
+            &mut s,
+            &tx,
+            0,
+            std::slice::from_ref(&prev),
+            leaf,
+            None,
+            true,
+            &mut SighashCache::new(&tx),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("exceeds"), "got: {err}");
     }
 

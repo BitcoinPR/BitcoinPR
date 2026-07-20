@@ -18,14 +18,41 @@ Completed work lives in [CHANGELOG.md](CHANGELOG.md).
   Before merging: rebase if needed and run the interop suite via the
   recreate-only-bitcoinpr procedure.
 
-### Follow-ups (added 2026-07-12)
+### BIP-110 Late-Upgrade Chainstate Gap (from blockslop.dev audit of Knots, analyzed 2026-07-18)
 
-- [ ] **Scripthash resolver: byte offset in `TxIndexEntry`** — the structural
-  follow-up to the 2026-07-12 backfill efficiency rework (see CHANGELOG):
-  storing `(offset, len)` alongside `(block_hash, tx_pos)` would make each
-  cache-missed prevout a single small read + one tx decode instead of a
-  partial block scan. Needs a v2 entry format and a tx-index reindex (or
-  write-new/read-both migration).
+blockslop.dev documents a gap class in Knots v29.3: BIP-110 validation runs
+only in `ConnectBlock()`, but restart trusts the persisted chainstate — a node
+that connected RDTS-invalid blocks *before* enabling enforcement keeps them
+after upgrade, forking the network into as many chains as there are
+pre-upgrade histories. Their fix: per-block "validated under BIP-110" status
+bits + startup ancestry scan + fail-closed `-reindex-chainstate` demand
+(SegWit `BLOCK_OPT_WITNESS`/`NeedsRedownload()` precedent). We share the
+shape (validation in `connect_block`, `load_chain_tip` trusts the tip, no
+positive provenance), and enforcement config can change between runs on one
+datadir three ways: a pre-BIP110-build datadir upgraded in place, adding or
+lowering `--bip110height`, and any future un-abandon of the capitulation
+flag. Mitigations we already have: `--reindex-chainstate` is a true
+replay-from-genesis through full `connect_block`; output-size rules run
+outside the assume-valid script gate (chain.rs:561); mainnet assume-valid
+(840,000) sits below the mandatory window (~961,632).
+
+Done 2026-07-20 (see CHANGELOG): enforcement-config fingerprint +
+fail-closed startup. The fingerprint machinery also covers any future
+un-abandon path automatically (config change → mismatch → reindex demand).
+Remaining:
+
+- [ ] **Assume-valid/BIP-110 interlock** — startup check: if the hardcoded
+  assume-valid block height is ever ≥ the mandatory-window start, warn or
+  refuse; prevents a future assume-valid bump from silently skipping
+  per-input RDTS script rules for buried blocks.
+- [ ] **`Bip110Checker::activation_for` fails open on missing ancestors**
+  (minor) — returns `INACTIVE` (no enforcement) when an ancestor header is
+  missing (bip110.rs:172-188); comment calls it fail-closed but "don't
+  enforce" is fail-open for a consensus check. Likely unreachable in the
+  connect path (MTP check fails closed first) — return an error to match the
+  rest of validation's failure direction.
+
+### Follow-ups (added 2026-07-12)
 
 - [ ] **Block-download stall detectors misfire at tip** — the head-of-line
   escalation (node.rs "Head-of-line block stalled"), stale per-peer request
@@ -44,6 +71,65 @@ Completed work lives in [CHANGELOG.md](CHANGELOG.md).
   a reorg-safe depth (a few thousand blocks) would reclaim most of that
   230 GB. Core keeps the equivalent in `rev*.dat` and prunes it with block
   files.
+
+### IBD Performance (from Core tracking PR bitcoin/bitcoin#32043, analyzed 2026-07-17)
+
+All 8 actionable analogues implemented 2026-07-20 (see CHANGELOG). Left on
+the table from that analysis: pipelining the next block's UTXO prefetch
+during script verification (new architecture, not a port — our `multi_get`
+prefetch already covers Core #31132's win otherwise), and
+`ingest_external_file` sorted-SST flushes as a further RocksDB-only step
+beyond the chunked-flush fix. Caveat still applies: the 2026-07-03 mainnet
+IBD was substantially network-bound (10–15 Mbps), so profile before chasing
+more CPU wins.
+
+### Signature Verification Throughput (from libbitcoin GPU-verification claim, analyzed 2026-07-20)
+
+A libbitcoin developer cited a 59-minute full validation run "using GPU
+signature verification." That traces to libbitcoin-system PR #1855
+("GPU/CPU batch signature verification, UltrafastSecp256k1 backend"),
+opened and closed same-day (2026-05-30) by maintainer evoskuil as "Retain
+for reference" — an unmerged proof-of-concept, not a shipped feature. It
+packs `(hash, pubkey, signature)` triples extracted during script execution
+into flat row buffers and dispatches to a GPU backend (CUDA/OpenCL/Metal)
+with mandatory CPU fallback, gated by a bit-for-bit consensus differential
+check against stock libsecp256k1. Their non-GPU fallback is thread-parallel
+CPU verification — the same idea as our existing rayon `par_iter` script
+checks (`chain.rs:846`), so we already have parity with libbitcoin's
+*default* build; the gap is algorithmic batching / GPU, which stock
+libsecp256k1 (underneath both projects) doesn't provide natively either.
+
+The two free-standing CPU fixes surfaced by that comparison (shared
+`Secp256k1<VerifyOnly>` context; one `SighashCache` per `verify_script`
+threaded through the interpreter) were implemented 2026-07-20 — see
+CHANGELOG. Note: the cache ended up per-input rather than per-transaction
+(`SighashCache` is not `Clone`/shareable across the rayon fan-out), which
+still captures the multisig/taproot re-hash win with zero consensus risk.
+
+Bigger structural option, deferred pending measurement:
+
+- [ ] **Profile `--reindex-chainstate` / post-assumevalid script-check
+  wall-clock before considering a batch/GPU backend** — `chain.rs:223`
+  skips script verification entirely below the assume-valid block
+  (mainnet 840,000 per the BIP-110 gap section above), so a normal
+  from-genesis IBD only runs full signature verification for the tail past
+  that height. The place batching would actually pay off for us is a full
+  `--reindex-chainstate` replay (genesis-to-tip through `connect_block`,
+  no assume-valid shortcut) or a future raised/removed assume-valid height.
+  Our 2026-07-03 mainnet IBD was network-bound (10-15 Mbps), not CPU-bound,
+  except specific stretches — measure before investing further.
+- [ ] **If profiling justifies it: batch/GPU verification as an
+  experimental, opt-in backend only** — recognize standard script
+  templates (P2PKH/P2WPKH/P2TR-keypath/P2WSH-multisig; none branch control
+  flow on a CHECKSIG result, unlike generic Script), extract their
+  sig-check triples without full interpretation, accumulate across a
+  lookahead window of many blocks (one block's ~thousands of inputs is too
+  thin a batch for GPU throughput to matter), submit once, fall back to
+  today's per-input rayon path for anything non-standard. Requires the
+  same bit-for-bit differential gate against our current libsecp256k1 path
+  that libbitcoin's own (unmerged) attempt insisted on — this is
+  consensus-critical surface, and even its originating project wasn't
+  comfortable shipping it yet.
 
 ### SV2 / Datum Mining Gateway
 

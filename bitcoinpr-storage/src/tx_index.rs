@@ -18,19 +18,39 @@ const META_INDEXED_HEIGHT: &[u8] = b"__meta__indexed_height__";
 const TXINDEX_BLOCK_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Entry in the transaction index: maps txid → (block_hash, tx_position).
+///
+/// Two on-disk formats coexist (write-new/read-both migration):
+/// - v1 (36 bytes): `block_hash[32] || tx_pos_le[4]`
+/// - v2 (44 bytes): v1 + `tx_offset_le[4] || tx_len_le[4]`, the byte range of
+///   the serialized transaction *within the raw block* (block-relative, so
+///   entries stay valid across block-file migration/reindex). With it, a
+///   prevout lookup is one small positional read + one tx decode instead of a
+///   partial block scan.
 #[derive(Debug, Clone)]
 pub struct TxIndexEntry {
     pub block_hash: BlockHash,
     /// Position of the transaction within the block (0 = coinbase).
     pub tx_pos: u32,
+    /// v2: `(offset, len)` of the serialized tx within the raw block bytes.
+    /// `None` for legacy v1 entries.
+    pub tx_loc: Option<(u32, u32)>,
 }
 
 impl TxIndexEntry {
-    fn serialize(&self) -> [u8; 36] {
-        let mut buf = [0u8; 36];
+    /// Serialize into a fixed buffer; returns the buffer and the encoded
+    /// length (36 for v1 entries, 44 for v2).
+    fn serialize(&self) -> ([u8; 44], usize) {
+        let mut buf = [0u8; 44];
         buf[0..32].copy_from_slice(AsRef::<[u8; 32]>::as_ref(&self.block_hash));
         buf[32..36].copy_from_slice(&self.tx_pos.to_le_bytes());
-        buf
+        match self.tx_loc {
+            Some((offset, len)) => {
+                buf[36..40].copy_from_slice(&offset.to_le_bytes());
+                buf[40..44].copy_from_slice(&len.to_le_bytes());
+                (buf, 44)
+            }
+            None => (buf, 36),
+        }
     }
 
     fn deserialize(data: &[u8]) -> StorageResult<Self> {
@@ -43,8 +63,36 @@ impl TxIndexEntry {
         hash_bytes.copy_from_slice(&data[0..32]);
         let block_hash = BlockHash::from_byte_array(hash_bytes);
         let tx_pos = u32::from_le_bytes(data[32..36].try_into().expect("length checked above"));
-        Ok(TxIndexEntry { block_hash, tx_pos })
+        let tx_loc = if data.len() >= 44 {
+            Some((
+                u32::from_le_bytes(data[36..40].try_into().expect("length checked above")),
+                u32::from_le_bytes(data[40..44].try_into().expect("length checked above")),
+            ))
+        } else {
+            None
+        };
+        Ok(TxIndexEntry {
+            block_hash,
+            tx_pos,
+            tx_loc,
+        })
     }
+}
+
+/// Compute per-transaction `(offset, len)` byte locations within the raw
+/// consensus-serialized block: 80-byte header, tx-count varint, then each tx.
+/// `Transaction::total_size` is the exact consensus-encoded size (witness
+/// included when present), so the offsets match the raw bytes in the block
+/// store without re-serializing anything.
+pub fn compute_tx_locations(block: &bitcoin::Block) -> Vec<(u32, u32)> {
+    let mut offset = 80usize + bitcoin::consensus::encode::VarInt::from(block.txdata.len()).size();
+    let mut locs = Vec::with_capacity(block.txdata.len());
+    for tx in &block.txdata {
+        let len = tx.total_size();
+        locs.push((offset as u32, len as u32));
+        offset += len;
+    }
+    locs
 }
 
 /// Transaction index: maps txid to the block containing it.
@@ -117,12 +165,32 @@ impl TxIndex {
             let entry = TxIndexEntry {
                 block_hash: *block_hash,
                 tx_pos: pos as u32,
+                tx_loc: None,
             };
             let key: &[u8; 32] = AsRef::<[u8; 32]>::as_ref(txid);
-            batch.put(key, entry.serialize());
+            let (buf, len) = entry.serialize();
+            batch.put(key, &buf[..len]);
         }
         self.db.write(batch)?;
         debug!(block = %block_hash, txs = txids.len(), "Indexed block transactions");
+        Ok(())
+    }
+
+    /// Rewrite entries with their v2 byte locations (write-new/read-both
+    /// migration). Called opportunistically by the prevout resolver when a
+    /// funding-block scan has discovered the locations anyway, so future
+    /// lookups of the same txs skip the block scan.
+    pub fn upgrade_tx_locations(&self, updates: &[(Txid, TxIndexEntry)]) -> StorageResult<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut batch = rocksdb::WriteBatch::default();
+        for (txid, entry) in updates {
+            let key: &[u8; 32] = AsRef::<[u8; 32]>::as_ref(txid);
+            let (buf, len) = entry.serialize();
+            batch.put(key, &buf[..len]);
+        }
+        self.db.write(batch)?;
         Ok(())
     }
 
@@ -160,20 +228,25 @@ impl TxIndex {
     }
 
     /// Index all transactions in a block and update the indexed height.
+    /// `tx_locs`, when provided (from [`compute_tx_locations`]), writes v2
+    /// entries carrying the tx byte locations within the raw block.
     pub fn index_block_at_height(
         &self,
         block_hash: &BlockHash,
         txids: &[Txid],
         height: u32,
+        tx_locs: Option<&[(u32, u32)]>,
     ) -> StorageResult<()> {
         let mut batch = rocksdb::WriteBatch::default();
         for (pos, txid) in txids.iter().enumerate() {
             let entry = TxIndexEntry {
                 block_hash: *block_hash,
                 tx_pos: pos as u32,
+                tx_loc: tx_locs.and_then(|l| l.get(pos).copied()),
             };
             let key: &[u8; 32] = AsRef::<[u8; 32]>::as_ref(txid);
-            batch.put(key, entry.serialize());
+            let (buf, len) = entry.serialize();
+            batch.put(key, &buf[..len]);
         }
         batch.put(META_INDEXED_HEIGHT, height.to_le_bytes());
         self.db.write(batch)?;
@@ -242,7 +315,7 @@ mod tests {
             .unwrap();
 
         tx_index
-            .index_block_at_height(&block_hash, &[txid], 0)
+            .index_block_at_height(&block_hash, &[txid], 0, None)
             .unwrap();
 
         // Transaction should be indexed
@@ -263,9 +336,59 @@ mod tests {
             .unwrap();
 
         tx_index
-            .index_block_at_height(&block_hash2, &[txid2], 5)
+            .index_block_at_height(&block_hash2, &[txid2], 5, None)
             .unwrap();
         assert_eq!(tx_index.get_indexed_height().unwrap(), Some(5));
+    }
+
+    #[test]
+    fn test_v2_entry_roundtrip_and_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let tx_index = TxIndex::open(&dir.path().join("txindex")).unwrap();
+
+        let block_hash: BlockHash =
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+                .parse()
+                .unwrap();
+        let txid: Txid = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+            .parse()
+            .unwrap();
+
+        // v2 write via index_block_at_height with locations
+        tx_index
+            .index_block_at_height(&block_hash, &[txid], 7, Some(&[(81, 204)]))
+            .unwrap();
+        let entry = tx_index.get(&txid).unwrap().unwrap();
+        assert_eq!(entry.tx_pos, 0);
+        assert_eq!(entry.tx_loc, Some((81, 204)));
+
+        // v1 write (index_block writes legacy entries) reads back as None loc
+        let txid2: Txid = "0e3e2357e806b6cdb1f70b54c3a3a17b6714ee1f0e68bebb44a74b1efd512098"
+            .parse()
+            .unwrap();
+        tx_index.index_block(&block_hash, &[txid2]).unwrap();
+        let entry = tx_index.get(&txid2).unwrap().unwrap();
+        assert_eq!(entry.tx_loc, None);
+        assert_eq!(entry.tx_pos, 0);
+
+        // Opportunistic upgrade rewrites v1 → v2
+        tx_index
+            .upgrade_tx_locations(&[(
+                txid2,
+                TxIndexEntry {
+                    block_hash,
+                    tx_pos: 0,
+                    tx_loc: Some((285, 150)),
+                },
+            )])
+            .unwrap();
+        let entry = tx_index.get(&txid2).unwrap().unwrap();
+        assert_eq!(entry.tx_loc, Some((285, 150)));
+
+        // get_many sees both formats
+        let many = tx_index.get_many(&[txid, txid2]);
+        assert_eq!(many[0].as_ref().unwrap().tx_loc, Some((81, 204)));
+        assert_eq!(many[1].as_ref().unwrap().tx_loc, Some((285, 150)));
     }
 
     #[test]

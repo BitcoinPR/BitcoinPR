@@ -146,6 +146,62 @@ pub fn activation_at(
     }
 }
 
+/// Canonical fingerprint of the *effective* BIP-110 enforcement config, for
+/// the late-upgrade chainstate-gap check (blockslop.dev audit of Knots
+/// v29.3): blocks are validated under whatever config is in force when they
+/// connect, so a config change between runs means the persisted chainstate
+/// was not checked under the current rules. Startup persists this string in
+/// header-index META and fails closed on a mismatch that would enforce over
+/// an uncovered validated range.
+///
+/// Call with the params *after* the abandoned-flag override has been applied,
+/// so the fingerprint reflects what validation will actually enforce.
+pub fn config_fingerprint(params: &crate::consensus::ConsensusParams) -> String {
+    if let Some(h) = params.bip110_activation_height {
+        return format!("fixed:{h}");
+    }
+    match &params.bip110_deployment {
+        Some(d) => format!(
+            "deployment:period={},bit={},start={},threshold={},floor={},window={}-{},duration={}",
+            d.period,
+            d.bit,
+            d.start_time,
+            d.threshold,
+            d.lock_in_floor_height,
+            d.mandatory_window.0,
+            d.mandatory_window.1,
+            d.active_duration
+        ),
+        None => "off".to_string(),
+    }
+}
+
+/// The lowest height at which the current config enforces (or has ever
+/// enforced) the RDTS rules, as determinable from the header chain at the
+/// validated tip. `None` means the config enforces nothing yet — either it is
+/// off/abandoned, or the signaling deployment has not locked in as of the
+/// tip (activation is then necessarily in the future). Used by the startup
+/// fingerprint check: enforcement at or below the validated height over a
+/// range the fingerprint doesn't cover demands `--reindex-chainstate`.
+pub fn earliest_enforced_height(
+    params: &crate::consensus::ConsensusParams,
+    header_index: &HeaderIndex,
+    tip_hash: &BlockHash,
+    tip_height: u32,
+) -> Option<u32> {
+    if let Some(h) = params.bip110_activation_height {
+        return Some(h);
+    }
+    let dep = params.bip110_deployment.as_ref()?;
+    // Throwaway checker: the memo cache is only a speedup, correctness comes
+    // from the header chain. Evaluate as the hypothetical next block so the
+    // state includes every transition observable at the tip.
+    let checker = Bip110Checker::new(dep.clone());
+    checker
+        .activation_for(header_index, tip_hash, tip_height + 1)
+        .activation_height
+}
+
 /// Computes (and caches) BIP-110 deployment state for blocks from their ancestor
 /// chain. The cache is keyed by period-boundary block hash (the last block of a
 /// retarget period), which commits to the entire ancestor chain — so cached
@@ -575,6 +631,72 @@ mod tests {
             "fork B should not activate"
         );
         assert_eq!(b.activation_height, None);
+    }
+
+    #[test]
+    fn config_fingerprint_distinguishes_modes() {
+        let mut params = crate::consensus::ConsensusParams::for_network(Network::Bitcoin);
+        let dep_fp = config_fingerprint(&params);
+        assert!(dep_fp.starts_with("deployment:"));
+
+        // Fixed mode overrides the deployment.
+        params.bip110_activation_height = Some(200);
+        assert_eq!(config_fingerprint(&params), "fixed:200");
+
+        // Off / abandoned.
+        params.bip110_activation_height = None;
+        params.bip110_deployment = None;
+        assert_eq!(config_fingerprint(&params), "off");
+
+        // Any parameter change changes the fingerprint.
+        let mut params2 = crate::consensus::ConsensusParams::for_network(Network::Bitcoin);
+        params2.bip110_deployment.as_mut().unwrap().threshold += 1;
+        assert_ne!(config_fingerprint(&params2), dep_fp);
+    }
+
+    #[test]
+    fn earliest_enforced_height_modes() {
+        // Same shape as full_lifecycle_signaling_lockin: heights 4-7 signal →
+        // lock-in at boundary 7 → ACTIVE at 12.
+        let mut blocks = Vec::new();
+        for h in 1..=13u32 {
+            let v = if (4..=7).contains(&h) {
+                SIGNAL
+            } else {
+                NO_SIGNAL
+            };
+            blocks.push((v, 2000));
+        }
+        let (_d, hi, hashes) = build_chain(&blocks);
+        let mut params = crate::consensus::ConsensusParams::for_network(Network::Regtest);
+        params.bip110_deployment = Some(test_dep());
+
+        // Before lock-in is observable at the tip: nothing enforced.
+        assert_eq!(earliest_enforced_height(&params, &hi, &hashes[5], 5), None);
+        // After lock-in: activation height known even before it is reached.
+        assert_eq!(
+            earliest_enforced_height(&params, &hi, &hashes[8], 8),
+            Some(12)
+        );
+        assert_eq!(
+            earliest_enforced_height(&params, &hi, &hashes[13], 13),
+            Some(12)
+        );
+
+        // Fixed mode takes precedence over the deployment.
+        params.bip110_activation_height = Some(3);
+        assert_eq!(
+            earliest_enforced_height(&params, &hi, &hashes[13], 13),
+            Some(3)
+        );
+
+        // Off / abandoned: nothing enforced.
+        params.bip110_activation_height = None;
+        params.bip110_deployment = None;
+        assert_eq!(
+            earliest_enforced_height(&params, &hi, &hashes[13], 13),
+            None
+        );
     }
 
     #[test]

@@ -1426,7 +1426,7 @@ impl BitcoinRpcServer for RpcServer {
 
             // Connect the block
             match cs.connect_block(&block, height) {
-                Ok(()) => {
+                Ok(block_txids) => {
                     // Keep META_HEADER_TIP_HEIGHT in sync ONLY after the block
                     // actually connects, so that:
                     //   1. getblockchaininfo returns the correct `headers` value, and
@@ -1461,7 +1461,8 @@ impl BitcoinRpcServer for RpcServer {
                     // via the P2P drain loop that normally calls remove_for_block),
                     // so without this the mined txs would linger in the mempool and
                     // the next template would try to re-include already-spent inputs.
-                    block_in_place(|| self.state.mempool.blocking_write()).remove_for_block(&block);
+                    block_in_place(|| self.state.mempool.blocking_write())
+                        .remove_for_block(&block, &block_txids);
 
                     // Update RpcState best_height/best_hash so getblockcount etc. reflect the new tip
                     *block_in_place(|| self.state.best_height.blocking_write()) = height;

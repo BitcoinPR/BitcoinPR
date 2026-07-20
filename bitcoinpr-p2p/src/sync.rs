@@ -658,7 +658,7 @@ impl HeaderSync {
                 );
             }
 
-            if self.best_height % 1000 == 0 || accepted < 2000 {
+            if self.best_height.is_multiple_of(1000) || accepted < 2000 {
                 info!(
                     height = self.best_height,
                     accepted,

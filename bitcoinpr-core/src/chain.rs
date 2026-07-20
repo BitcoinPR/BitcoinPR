@@ -1,7 +1,6 @@
 use bitcoin::blockdata::block::Block;
 use bitcoin::{BlockHash, OutPoint, Transaction, TxOut};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
 
 use crate::consensus::ConsensusParams;
@@ -106,7 +105,11 @@ impl ChainState {
     }
 
     /// Connect a block to the chain: validate, update UTXO set, store block.
-    pub fn connect_block(&mut self, block: &Block, height: u32) -> CoreResult<()> {
+    ///
+    /// Returns the block's txids (`txids[i]` for `block.txdata[i]`), already
+    /// computed for merkle verification — callers doing post-connect work
+    /// (mempool eviction, indexing) should reuse them instead of re-hashing.
+    pub fn connect_block(&mut self, block: &Block, height: u32) -> CoreResult<Vec<bitcoin::Txid>> {
         self.connect_block_with_raw(block, height, None)
     }
 
@@ -116,7 +119,7 @@ impl ChainState {
         block: &Block,
         height: u32,
         raw_bytes: Option<&[u8]>,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<Vec<bitcoin::Txid>> {
         let connect_start = std::time::Instant::now();
         let hash = block.block_hash();
 
@@ -149,9 +152,42 @@ impl ChainState {
         // 5. Validate coinbase
         validation::validate_coinbase(block, height, &self.params)?;
 
-        // 6. Validate SegWit witness commitment (BIP 141)
-        if height >= self.params.segwit_height {
-            validation::validate_witness_commitment(block)?;
+        // Decide whether scripts will be verified (needed below to know if
+        // wtxids are worth precomputing). Skip script verification for blocks
+        // at or before the assume-valid block: once we connect the
+        // assume-valid block itself, we've validated the header chain's PoW
+        // all the way up, so all prior scripts are trusted.
+        let verify_scripts = match &self.params.assume_valid {
+            Some(assume_hash) => {
+                if hash == *assume_hash {
+                    false // The assume-valid block itself is trusted
+                } else {
+                    // Check if the assume-valid block is in our header chain
+                    match self.header_index.get_header(assume_hash) {
+                        Ok(Some(av_header)) => height > av_header.height,
+                        _ => true, // If we can't find it, verify everything
+                    }
+                }
+            }
+            None => true,
+        };
+
+        // 6. Validate SegWit witness commitment (BIP 141). wtxids are computed
+        //    at most once per block and shared between the commitment check and
+        //    the sig-cache keys used when queueing script checks — previously
+        //    each SegWit block paid for them twice (Core #32487 spirit).
+        let need_commitment =
+            height >= self.params.segwit_height && validation::block_has_witness(block);
+        let wtxids: Option<Vec<bitcoin::Wtxid>> = if verify_scripts || need_commitment {
+            Some(block.txdata.iter().map(|tx| tx.compute_wtxid()).collect())
+        } else {
+            None
+        };
+        if need_commitment {
+            let w = wtxids
+                .as_deref()
+                .expect("wtxids computed when commitment needed");
+            validation::validate_witness_commitment_with_wtxids(block, w)?;
         }
 
         // 6b. Median-time-past (BIP 113): the block timestamp must be strictly
@@ -217,25 +253,6 @@ impl ChainState {
             self.params.taproot_height,
         );
 
-        // Skip script verification for blocks at or before the assume-valid block.
-        // Once we connect the assume-valid block itself, we've validated the
-        // header chain's PoW all the way up, so all prior scripts are trusted.
-        let verify_scripts = match &self.params.assume_valid {
-            Some(assume_hash) => {
-                // Check if we've already passed the assume-valid point
-                if hash == *assume_hash {
-                    false // The assume-valid block itself is trusted
-                } else {
-                    // Check if the assume-valid block is in our header chain
-                    match self.header_index.get_header(assume_hash) {
-                        Ok(Some(av_header)) => height > av_header.height,
-                        _ => true, // If we can't find it, verify everything
-                    }
-                }
-            }
-            None => true,
-        };
-
         // BIP-110 deployment state for this block (dynamic, signaling-driven on
         // mainnet; fixed-mode on the --bip110height override). Computed once and
         // reused for the mandatory-signaling check and per-tx enforcement.
@@ -263,6 +280,7 @@ impl ChainState {
             block,
             height,
             &txids,
+            wtxids.as_deref(),
             script_flags,
             verify_scripts,
             block_mtp,
@@ -341,9 +359,12 @@ impl ChainState {
             .set_pending_flush_height(height, hash_bytes_for_meta);
         let flushed = self.utxo_set.apply_batch(&utxo_batch)?;
 
-        // 11. Update transaction index if enabled (reuses pre-computed txids)
+        // 11. Update transaction index if enabled (reuses pre-computed txids).
+        // Byte locations make the entries v2 (direct tx reads for the
+        // scripthash prevout resolver).
         if let Some(ref tx_index) = self.tx_index {
-            tx_index.index_block_at_height(&hash, &txids, height)?;
+            let tx_locs = bitcoinpr_storage::compute_tx_locations(block);
+            tx_index.index_block_at_height(&hash, &txids, height, Some(&tx_locs))?;
         }
 
         // 12. Update chain tip (in-memory always, on-disk only when UTXO is flushed)
@@ -369,11 +390,11 @@ impl ChainState {
         }
 
         // Periodically clear sig cache to bound memory growth
-        if height % 10_000 == 0 {
+        if height.is_multiple_of(10_000) {
             self.sig_cache.clear();
         }
 
-        if height % 1000 == 0 {
+        if height.is_multiple_of(1000) {
             if let Some(peer_best) = self.peer_best_height {
                 let progress = if peer_best > 0 {
                     (height as f64 / peer_best as f64) * 100.0
@@ -396,7 +417,7 @@ impl ChainState {
             warn!(height, hash = %hash, connect_ms, flushed, "Slow block connect");
         }
 
-        Ok(())
+        Ok(txids)
     }
 
     /// Disconnect a block from the chain tip, reversing UTXO changes.
@@ -510,13 +531,17 @@ impl ChainState {
         block: &Block,
         height: u32,
         txids: &[bitcoin::Txid],
+        wtxids: Option<&[bitcoin::Wtxid]>,
         script_flags: ScriptFlags,
         verify_scripts: bool,
         block_mtp: u32,
         bip110: crate::bip110::Bip110Activation,
     ) -> CoreResult<UtxoBatch> {
         let mut batch = UtxoBatch::new();
-        let mut spent_in_block = HashSet::new();
+        // Outpoint-keyed maps use the fast hasher (Core #30442 analogue):
+        // txid prefixes are already SHA256d output, SipHash buys nothing.
+        let mut spent_in_block: bitcoinpr_storage::FastHashSet<OutPoint> =
+            bitcoinpr_storage::FastHashSet::default();
         let mut total_fees: u64 = 0;
         // Block sigop *cost* (Bitcoin Core's MAX_BLOCK_SIGOPS_COST). Legacy and
         // P2SH sigops are scaled by the witness factor (×4); witness sigops ×1.
@@ -538,7 +563,8 @@ impl ChainState {
         }
 
         // Fast index for outputs created earlier in this block (intra-block spending).
-        let mut intra_block_utxos: HashMap<OutPoint, UtxoEntry> = HashMap::new();
+        let mut intra_block_utxos: bitcoinpr_storage::FastHashMap<OutPoint, UtxoEntry> =
+            bitcoinpr_storage::FastHashMap::default();
 
         // Collect script verification tasks: (tx, input_index, prev_output, all_prevouts, wtxid)
         // all_prevouts is shared across inputs of the same tx (needed for Taproot BIP 341 sighash).
@@ -750,7 +776,13 @@ impl ChainState {
 
             // Queue script verifications now that we have all prevouts for this tx
             if verify_scripts {
-                let wtxid = tx.compute_wtxid();
+                // wtxids were precomputed in connect_block_with_raw whenever
+                // verify_scripts is set; the fallback only serves direct
+                // callers/tests of this fn.
+                let wtxid = match wtxids {
+                    Some(w) => w[tx_idx],
+                    None => tx.compute_wtxid(),
+                };
                 let prevouts_arc = std::sync::Arc::new(tx_prevouts);
                 for (vin, &input_height) in input_heights.iter().enumerate() {
                     // BIP-110 rules 2-7 apply only while the deployment is ACTIVE
