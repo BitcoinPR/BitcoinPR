@@ -101,6 +101,52 @@ transaction crafted to *look* like a script-path spend without being one would
 be policy-rejected — an acceptable false positive for relay purposes, since
 such a transaction is deliberately unusual.
 
+### Parasites: covert opcode-choice encoding (`tx_first_covert_opcode_input`)
+
+> **Status: parked.** Implemented and gate/interop-verified on branch
+> `claude/op-plenty-covert-opcode-filter`, deliberately left unmerged —
+> same parking convention as the bare-envelope filter below, landing
+> alongside other BIP-110-era relay-policy additions once BIP-110
+> activation is confirmed. See `TODO.md`.
+
+A public gist ("OP_PLENTY", stevenrabinow-hash) demonstrates a data-embedding
+technique that performs **no data push at all**. Each payload nibble is
+represented by *which* opcode appears at a given script position, drawn from
+a 28-opcode alphabet (`OP_1`, `OP_8`–`OP_16`, `OP_NOP`, `OP_NIP`, `OP_OVER`,
+`OP_EQUAL`, `OP_NEGATE`, `OP_ABS`, `OP_NOT`, `OP_0NOTEQUAL`, `OP_ADD`,
+`OP_BOOLAND`, `OP_BOOLOR`, `OP_NUMEQUAL`, `OP_NUMNOTEQUAL`,
+`OP_LESSTHAN(OREQUAL)`, `OP_GREATERTHAN(OREQUAL)`, `OP_MAX`) chosen so every
+member sits outside BIP342's `OP_SUCCESSx` ranges. A depth-tracking state
+machine on the encoder side keeps the scratch stack inside `{5,6,7}` items so
+the script always validates; decoding is stateless (`opcode % 22 == nibble`).
+An optional self-framing variant prefixes seven `OP_5` opcodes (a magic
+marker) plus an 8-nibble length header, but the core codec needs neither —
+so detection cannot rely on the marker alone.
+
+Detection is structural, keyed on the construction's own required shape
+rather than the (optional, spoofable) magic bytes:
+
+1. **Recognize a script-path spend** the same way as the classic envelope
+   (`taproot_leaf_script`).
+2. **Find the longest contiguous run of opcodes drawn only from the
+   28-opcode alphabet** — no data pushes, no branching. Any push (even a
+   single byte) breaks the run.
+3. **Require the run to be ≥ 24 opcodes** (roughly a dozen encoded payload
+   bytes past the optional 8-nibble length header) **and immediately followed
+   by one of the three footers** that collapse the scratch stack back to a
+   clean truthy value: `OP_2DROP OP_2DROP OP_NOP` (exit depth 5),
+   `OP_2DROP OP_2DROP OP_DROP` (depth 6), or `OP_2DROP OP_2DROP OP_2DROP`
+   (depth 7). Every encoding in this family ends in one of these three
+   sequences — it's the only way the construction can leave a clean stack, so
+   it's a precise anchor independent of alphabet or framing choices.
+
+Known limitation: an attacker who splices junk data pushes into the middle of
+the opcode run to keep every contiguous segment under the threshold evades
+this heuristic (see `test_op_plenty_encoding_detection`'s split-run case).
+Raising sensitivity to catch that trades away false-positive margin against
+legitimate scripts that happen to use a few of these (very ordinary)
+arithmetic/comparison opcodes in sequence.
+
 ### Tokens: protocol markers (`tx_token_protocol`)
 
 The token pattern table, in detection order:

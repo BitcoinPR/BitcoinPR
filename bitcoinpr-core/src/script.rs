@@ -369,6 +369,101 @@ pub fn tx_first_inscription_input(tx: &Transaction) -> Option<usize> {
     })
 }
 
+// ─── Covert opcode-choice encoding (OP_PLENTY-style, BIP-110-era) ──────────
+//
+// A post-BIP-110 data-embedding technique that performs no data push at all:
+// each payload nibble is represented by *which* opcode appears at a given
+// position, drawn from a small set of stack-arithmetic/comparison opcodes.
+// The alphabet is chosen so no member falls in a BIP342 OP_SUCCESSx range
+// (BIP-110 makes rejecting those mandatory) and none require OP_IF/OP_NOTIF
+// (BIP-110 disables those in tapscript). A depth-tracking state machine on
+// the encoder side keeps the scratch stack inside {5,6,7} items so the
+// script always validates; decoding is stateless (opcode % 22 == nibble).
+// Public reference: the "OP_PLENTY" gist (stevenrabinow-hash, 2026-07-22).
+
+/// The 28-opcode alphabet OP_PLENTY draws payload/length nibbles from: every
+/// opcode whose numeric value is congruent to a nibble (0x0-0xf) modulo 22,
+/// selected by the encoder for depth-steering behavior and BIP-110/BIP-342
+/// safety. Does not include the footer opcodes (`OP_2DROP`, `OP_DROP`) or the
+/// `OP_5` magic/preamble byte, which the encoder never uses to carry a
+/// nibble — those are checked separately.
+const OP_PLENTY_ALPHABET: [u8; 28] = [
+    0x51, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x60, 0x61,
+    0x78, // growing/hold reps
+    0x77, 0x87, 0x93, 0x9a, 0x9b, 0x9c, 0x9e, 0x9f, 0xa0, 0xa1, 0xa2, 0xa4, // shrinking reps
+    0x8f, 0x90, 0x91, 0x92, // depth-neutral unary reps
+];
+
+/// The three 3-opcode footers that collapse the scratch stack back to its
+/// truthy anchor, one per exit depth (5, 6, 7). Every OP_PLENTY encoding ends
+/// with exactly one of these — it's the only way the construction can leave
+/// a clean stack, independent of alphabet or framing choices.
+const OP_PLENTY_FOOTERS: [[u8; 3]; 3] = [
+    [0x6d, 0x6d, 0x61], // OP_2DROP OP_2DROP OP_NOP   (depth 5)
+    [0x6d, 0x6d, 0x75], // OP_2DROP OP_2DROP OP_DROP  (depth 6)
+    [0x6d, 0x6d, 0x6d], // OP_2DROP OP_2DROP OP_2DROP (depth 7)
+];
+
+/// Minimum length, in opcodes, of an alphabet-only run before it's treated as
+/// a plausible covert payload rather than incidental use of a handful of
+/// comparison/arithmetic opcodes in an ordinary script. 24 is conservative:
+/// past the (optional) 8-nibble v2 length header, it still requires roughly a
+/// dozen encoded payload bytes — well past anything a normal spending
+/// condition chains together with zero data pushes and zero branching.
+const OP_PLENTY_MIN_RUN: usize = 24;
+
+/// Detects the OP_PLENTY covert opcode-choice encoding in a taproot leaf
+/// script: a contiguous run of at least [`OP_PLENTY_MIN_RUN`] opcodes drawn
+/// only from [`OP_PLENTY_ALPHABET`] (no data pushes, no branching),
+/// immediately followed by one of the [`OP_PLENTY_FOOTERS`].
+///
+/// Deliberately independent of the `OP_5`×7 v2 magic marker and the length
+/// header: both are optional framing per the encoder's own design ("the core
+/// codec does not require any particular marker or length format"), so a
+/// detector keyed on the marker alone would miss an unframed variant. The
+/// run-length + footer shape is structural to the construction itself — any
+/// encoder in this family must steer a small stack through a bounded depth
+/// walk and then collapse it, which is what the footer exists to do.
+fn has_op_plenty_encoding(script: &Script) -> bool {
+    // Flatten to one byte per instruction: the opcode's numeric value for a
+    // plain op, or a sentinel for a data push (0xff — not a member of the
+    // alphabet or any footer), which can never be part of the covert body.
+    let ops: Vec<u8> = script
+        .instructions()
+        .map(|inst| match inst {
+            Ok(Instruction::Op(op)) => op.to_u8(),
+            _ => 0xff,
+        })
+        .collect();
+
+    let mut run_start = 0;
+    for (i, &b) in ops.iter().enumerate() {
+        if OP_PLENTY_ALPHABET.contains(&b) {
+            continue;
+        }
+        if i - run_start >= OP_PLENTY_MIN_RUN {
+            if let Some(next3) = ops.get(i..i + 3) {
+                if OP_PLENTY_FOOTERS.iter().any(|f| f.as_slice() == next3) {
+                    return true;
+                }
+            }
+        }
+        run_start = i + 1;
+    }
+    false
+}
+
+/// Index of the first input whose tapscript carries an OP_PLENTY-style covert
+/// opcode-choice encoding — see [`has_op_plenty_encoding`]. `None` when the
+/// transaction is clean.
+pub fn tx_first_covert_opcode_input(tx: &Transaction) -> Option<usize> {
+    tx.input.iter().position(|input| {
+        taproot_leaf_script(&input.witness)
+            .map(Script::from_bytes)
+            .is_some_and(has_op_plenty_encoding)
+    })
+}
+
 /// First data push of an OP_RETURN script (the datacarrier payload), or `None`
 /// when there is none or the script doesn't decode.
 fn op_return_payload(script: &Script) -> Option<Vec<u8>> {
@@ -3670,6 +3765,100 @@ mod tests {
         // Plain (non-token) inscription: a parasite, but not a token.
         let ord = tx_with_witness(inscription_witness(b"just a picture"));
         assert_eq!(tx_token_protocol(&ord), None);
+    }
+
+    /// OP_PLENTY-style taproot script-path witness wrapping a pre-built leaf
+    /// script (produced by the reference python encoder from the scam gist
+    /// this detector defends against) plus a shape-valid 33-byte control
+    /// block.
+    fn op_plenty_witness(leaf: &[u8]) -> bitcoin::Witness {
+        let mut control = vec![0xc0];
+        control.extend_from_slice(&[0x02; 32]);
+        let mut w = bitcoin::Witness::new();
+        w.push([0u8; 64]); // dummy schnorr signature argument
+        w.push(leaf);
+        w.push(&control);
+        w
+    }
+
+    #[test]
+    fn test_op_plenty_encoding_detection() {
+        // All hex fixtures below are `encode(...)` output from the gist's
+        // own reference implementation (v2 self-framed form: seven OP_5 +
+        // 8 length-nibble opcodes + payload opcodes + footer), round-tripped
+        // through its `decode()` to confirm correctness before hardcoding.
+
+        // encode(bytes(range(16))): 16-byte payload clears the run threshold
+        // (8 length-nibble opcodes + 32 payload-nibble opcodes = 40).
+        let sixteen_bytes = hex::decode(
+            "555555555555559a589a589a589c589a589a599a5a9a5b9a5c9a5d9a5e9a5f9a\
+             609a6158a4588f9a9058919a9258936d6d75",
+        )
+        .unwrap();
+        assert_eq!(
+            tx_first_covert_opcode_input(&tx_with_witness(op_plenty_witness(&sixteen_bytes))),
+            Some(0)
+        );
+
+        // encode(b"visit hxxp://scam.example/claim to get free coins"): a
+        // realistically-sized message.
+        let realistic_payload = hex::decode(
+            "555555555555559a589a589a58a05aa15ea0615f875e775f9e5a9a5ea25fa25f\
+             a25f9a5ba45a935a935f875e875e9b5e919c925e9f5fa25e9b5e91a158a0905e\
+             9f5a935e875e90a059a0615e919c58a15ca0519c58a05fa05da15c9c58a05ea1\
+             5aa05da05d9c58a05ba051a0615e92a15b6d6d6d",
+        )
+        .unwrap();
+        assert_eq!(
+            tx_first_covert_opcode_input(&tx_with_witness(op_plenty_witness(&realistic_payload))),
+            Some(0)
+        );
+
+        // encode(b"Hi"): the docstring's own worked example. Its whole
+        // encoded body (length header + 2-byte payload + footer) is only 15
+        // opcodes, under OP_PLENTY_MIN_RUN — too small a message to be worth
+        // flagging, and a useful near-miss negative for the threshold.
+        let hi = hex::decode("555555555555559a589a589a589a5c9e60a0616d6d75").unwrap();
+        assert_eq!(
+            tx_first_covert_opcode_input(&tx_with_witness(op_plenty_witness(&hi))),
+            None
+        );
+
+        // A long alphabet-only run (30 opcodes, past the threshold) that
+        // does NOT end in a valid footer: not flagged. Confirms detection
+        // keys on the footer shape, not run length alone.
+        let mut no_footer = vec![0x9a; 30];
+        no_footer.extend_from_slice(&[0xac, 0xac, 0xac]); // OP_CHECKSIG x3, not a footer
+        assert_eq!(
+            tx_first_covert_opcode_input(&tx_with_witness(op_plenty_witness(&no_footer))),
+            None
+        );
+
+        // The same 40-opcode alphabet run as the 16-byte fixture, but with a
+        // single-byte data push spliced into the middle: each half falls
+        // under the run threshold on its own. Documents a known limitation
+        // (an attacker interleaving junk pushes can duck this heuristic) and
+        // confirms the detector degrades safely rather than panicking.
+        let (first_half, second_half) = sixteen_bytes.split_at(7 + 20);
+        let mut split_run = first_half.to_vec();
+        split_run.push(0x01); // PUSHBYTES_1
+        split_run.push(0xaa);
+        split_run.extend_from_slice(second_half);
+        assert_eq!(
+            tx_first_covert_opcode_input(&tx_with_witness(op_plenty_witness(&split_run))),
+            None
+        );
+
+        // Plain OP_TRUE leaf: clean.
+        assert_eq!(
+            tx_first_covert_opcode_input(&tx_with_witness(op_plenty_witness(&[0x51]))),
+            None
+        );
+
+        // Taproot key-path spend (single signature element): clean.
+        let mut w = bitcoin::Witness::new();
+        w.push([0u8; 64]);
+        assert_eq!(tx_first_covert_opcode_input(&tx_with_witness(w)), None);
     }
 
     #[test]
