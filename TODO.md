@@ -18,6 +18,25 @@ Completed work lives in [CHANGELOG.md](CHANGELOG.md).
   Before merging: rebase if needed and run the interop suite via the
   recreate-only-bitcoinpr procedure.
 
+### OP_PLENTY Covert Opcode-Choice Parasite Filter (parked)
+
+- [ ] **Merge branch `claude/op-plenty-covert-opcode-filter` (not yet
+  opened as a public PR) if/when BIP-110 activates** — a public gist
+  ("OP_PLENTY", stevenrabinow-hash) demonstrates a data-embedding technique
+  that performs no data push at all: payload nibbles are encoded as the
+  *choice* of opcode at each script position, drawn from a 28-opcode
+  alphabet picked to avoid BIP342 `OP_SUCCESSx` ranges. Evades
+  `datacarrier`, the BIP-110 push-size limit, and the classic/bare envelope
+  detectors, none of which see a data push or an `OP_IF`/`OP_2DROP`-run to
+  key on. The branch extends `rejectparasites` with
+  `tx_first_covert_opcode_input` (`script.rs`): a contiguous run of 24+
+  alphabet-only opcodes immediately followed by one of the three
+  stack-collapsing footers the construction requires. Gate green + interop
+  18/18 on the branch (2026-07-22); parked per the same convention as the
+  bare-envelope filter below — land it alongside other BIP-110-era
+  relay-policy additions once BIP-110 activation is confirmed. See
+  `docs/relay-policy.md`.
+
 ### BIP-110 Late-Upgrade Chainstate Gap (from blockslop.dev audit of Knots, analyzed 2026-07-18)
 
 blockslop.dev documents a gap class in Knots v29.3: BIP-110 validation runs

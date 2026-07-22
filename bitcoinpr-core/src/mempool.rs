@@ -209,6 +209,11 @@ fn check_relay_policy(tx: &Transaction, txid: Txid, params: &ConsensusParams) ->
                 "parasite: input {i} of tx {txid} carries an inscription envelope (rejectparasites=1)"
             )));
         }
+        if let Some(i) = script::tx_first_covert_opcode_input(tx) {
+            return Err(CoreError::InvalidTransaction(format!(
+                "parasite: input {i} of tx {txid} carries a covert opcode-choice encoding (rejectparasites=1)"
+            )));
+        }
     }
     if params.reject_tokens {
         if let Some(proto) = script::tx_token_protocol(tx) {
@@ -1893,6 +1898,51 @@ mod tests {
             .expect_err("runestone must be rejected by default")
             .to_string();
         assert!(err.contains("runes"), "got: {err}");
+    }
+
+    #[test]
+    fn test_covert_opcode_relay_policy() {
+        use bitcoin::ScriptBuf;
+
+        // OP_PLENTY-style covert opcode-choice witness: no data push at all,
+        // just an opcode run encoding the payload plus a control block
+        // (taproot script path). encode(bytes(range(16))) from the gist's
+        // own reference implementation.
+        let leaf = hex::decode(
+            "555555555555559a589a589a589c589a589a599a5a9a5b9a5c9a5d9a5e9a5f9a\
+             609a6158a4588f9a9058919a9258936d6d75",
+        )
+        .unwrap();
+        let mut control = vec![0xc0];
+        control.extend_from_slice(&[0x02; 32]);
+        let mut w = bitcoin::Witness::new();
+        w.push([0u8; 64]);
+        w.push(&leaf);
+        w.push(&control);
+
+        let spend_output = bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array(
+                [0x11; 20],
+            )),
+        };
+        let mut tx = tx_with_outputs(vec![spend_output]);
+        tx.input[0].witness = w;
+        let txid = tx.compute_txid();
+
+        // Rejected by default (rejectparasites=1); not a token, so
+        // rejecttokens plays no part.
+        let mut params = ConsensusParams::regtest();
+        let err = check_relay_policy(&tx, txid, &params)
+            .expect_err("covert opcode-choice encoding must be rejected by default")
+            .to_string();
+        assert!(
+            err.contains("parasite") && err.contains("covert opcode-choice"),
+            "got: {err}"
+        );
+
+        params.reject_parasites = false;
+        check_relay_policy(&tx, txid, &params).expect("clean with rejectparasites=0");
     }
 
     #[test]
