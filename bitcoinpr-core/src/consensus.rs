@@ -460,15 +460,25 @@ mod tests {
     #[test]
     fn test_bip110_deployment_config() {
         // Mainnet drives activation from signaling (a deployment, no fixed height).
+        // These values are the BIP-110 spec's published schedule (bips.dev/110):
+        // mandatory signaling opens 961632 (first height enforcing nodes can
+        // diverge from non-signaling peers), the window's last block is 963647,
+        // lock-in is forced at the following period boundary 963648, and
+        // activation follows one full retarget period later at 965664.
         let mainnet = ConsensusParams::mainnet();
         assert_eq!(mainnet.bip110_activation_height, None);
         let dep = mainnet
             .bip110_deployment
             .expect("mainnet has an RDTS deployment");
+        assert_eq!(dep.period, 2016);
         assert_eq!(dep.bit, 4);
-        assert_eq!(dep.threshold, 1109);
+        assert_eq!(dep.start_time, 1_764_547_200); // ~2025-12-01
+        assert_eq!(dep.threshold, 1109); // 1109/2016 = 55%
+        assert_eq!(dep.mandatory_window, (961_632, 963_647));
         assert_eq!(dep.lock_in_floor_height, 963_648);
         assert_eq!(dep.active_duration, 52_416);
+        // Activation is one retarget period after the lock-in floor.
+        assert_eq!(dep.lock_in_floor_height + dep.period, 965_664);
 
         // Other networks have neither a fixed override nor a deployment by default.
         for params in [

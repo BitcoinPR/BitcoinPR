@@ -1,0 +1,128 @@
+# docker-compose.split-signaling.yml
+#
+# 2-node BIP-110 MANDATORY-SIGNALING scenario cluster — SEPARATE from
+# docker-compose.split.yml (which drives the --bip110height FIXED-mode
+# scenarios in scripts/interop-split-scenario-*.sh). This fixture instead
+# drives the REAL signaling state machine (DEFINED -> STARTED -> LOCKED_IN ->
+# ACTIVE -> EXPIRED) via --bip110signaling, scaled down 126x from mainnet's
+# actual BIP-110 deployment (see bips.dev/110 and bitcoinpr-core/src/bip110.rs
+# Bip110Deployment::mainnet()):
+#
+#                          mainnet          this fixture (period 16)
+#   period                 2016             16
+#   bit                    4                4
+#   threshold              1109 (55%)       100 (unreachable — mirrors the
+#                                            real world's <1% signaling)
+#   mandatory window       961632-963647    96-111   (period right before
+#                                                      the lock-in floor)
+#   lock-in floor          963648           112
+#   activation             965664           128      (one period later)
+#
+# split-signaling-bitcoinpr enforces the mandatory-signaling rule
+# (bitcoinpr-core/src/chain.rs connect_block + the bitcoinpr-p2p header-sync
+# fast path); split-signaling-core is stock Bitcoin Core, which has no notion
+# of BIP-110 bit 4. Once the mandatory window opens, Core's ordinary
+# (non-signaling) blocks become the first point the chains can diverge —
+# exactly the mechanism described for mainnet height 961632.
+#
+# Usage:
+#   docker compose -p bitcoinpr-split-signaling -f docker-compose.split-signaling.yml up -d
+#   docker compose -p bitcoinpr-split-signaling -f docker-compose.split-signaling.yml down -v
+#
+# Reuses the same host ports as docker-compose.split.yml (19443/39443/13000);
+# do not run both clusters at once — tear one down before starting the other.
+#
+# Prerequisite: the bitcoinpr-local:full image (built by
+#   ./scripts/interop-cluster.sh start --build).
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+services:
+
+  split-signaling-bitcoinpr:
+    image: bitcoinpr-local:full
+    container_name: split-signaling-bitcoinpr
+    init: true
+    # unless-stopped also restarts after a CLEAN exit — required so the
+    # capitulation flow ("abandon minority chain" -> graceful shutdown) comes
+    # back up with the persisted flag applied.
+    restart: unless-stopped
+    mem_limit: 1g
+    logging: *default-logging
+    networks:
+      - split-signaling
+    # --connect split-signaling-core: the node must have an OUTBOUND peer —
+    # header sync does not engage for a deep catch-up off a purely inbound
+    # peer, which stalls IBD at genesis (Core's addnode side alone is not
+    # enough).
+    command: >
+      --network regtest
+      --datadir /data/bitcoinpr
+      --connect split-signaling-core:18444
+      --rpcbind 0.0.0.0
+      --rpcuser test
+      --rpcpassword test
+      --rpcport 18443
+      --port 18444
+      --loglevel debug
+      --txindex
+      --bip110signaling 16,4,0,100,112,96,111,48
+      --webport 3000
+      --webadmintoken splittest
+      --gossip-private-addrs
+    ports:
+      - "19443:18443"   # RPC
+      - "13000:3000"    # Web explorer (Split page)
+    volumes:
+      - split-signaling-bitcoinpr-data:/data/bitcoinpr
+    healthcheck:
+      test: >
+        bash -c 'exec 3<>/dev/tcp/localhost/18543 &&
+          printf "GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3 &&
+          cat <&3 | grep -q "OK"'
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  split-signaling-core:
+    # Pinned (not :latest) so the forged-block path (generateblock with raw
+    # tx hex, v0.21+) stays reproducible.
+    image: bitcoin/bitcoin:29
+    container_name: split-signaling-core
+    restart: unless-stopped
+    mem_limit: 512m
+    logging: *default-logging
+    networks:
+      - split-signaling
+    command:
+      - bitcoind
+      - -regtest
+      - -server=1
+      - -listen=1
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=test
+      - -rpcpassword=test
+      - -rpcport=18443
+      - -port=18444
+      - -addnode=split-signaling-bitcoinpr:18444
+      - -dnsseed=0
+      - -fallbackfee=0.0001
+      - -printtoconsole=1
+    ports:
+      - "39443:18443"   # RPC
+    volumes:
+      - split-signaling-core-data:/home/bitcoin/.bitcoin
+
+networks:
+  split-signaling:
+    driver: bridge
+
+volumes:
+  split-signaling-bitcoinpr-data:
+  split-signaling-core-data:

@@ -2,6 +2,7 @@
 //! network/datadir/port resolution. Extracted verbatim from main.rs (D1 of
 //! the main.rs decomposition).
 
+use bitcoinpr_core::Bip110Deployment;
 use clap::Parser;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -232,6 +233,20 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) bip110height: Option<u32>,
 
+    /// BIP-110 signaling-deployment override (regtest testing): drives the
+    /// real DEFINED→STARTED→LOCKED_IN→ACTIVE→EXPIRED state machine from
+    /// on-chain bit signaling instead of a fixed activation height. Format:
+    /// `period,bit,start_time,threshold,lockin_floor,window_lo,window_hi,active_duration`
+    /// (all integers; start_time is a Unix timestamp). Mirrors mainnet's real
+    /// deployment shape at any scale, e.g. `--bip110signaling
+    /// 16,4,0,100,112,96,111,32` locks in via the mandatory floor at height
+    /// 112 (window 96-111) with an unreachable voluntary threshold — the same
+    /// shape as mainnet's <1%-signaling situation. Takes effect only when
+    /// `--bip110height` is NOT also set (fixed mode always wins, matching
+    /// `ChainState::new`'s precedence).
+    #[arg(long)]
+    pub(crate) bip110signaling: Option<String>,
+
     /// Prune (delete) old block files, keeping total block-file size under
     /// this many MiB (0 = disabled; minimum 550). Undo records of pruned
     /// blocks are removed too. The most recent 288 blocks are always kept
@@ -330,6 +345,7 @@ pub(crate) struct Config {
     pub(crate) i2pacceptincoming: Option<bool>,
     pub(crate) gossip_private_addrs: Option<bool>,
     pub(crate) bip110height: Option<u32>,
+    pub(crate) bip110signaling: Option<String>,
     pub(crate) prune: Option<u64>,
     pub(crate) datacarrier: Option<bool>,
     pub(crate) permitbaremultisig: Option<bool>,
@@ -458,6 +474,7 @@ pub(crate) fn load_config(path: &PathBuf) -> anyhow::Result<Config> {
         i2pacceptincoming: conf_bool(&map, "i2pacceptincoming")?,
         gossip_private_addrs: conf_bool(&map, "gossipprivateaddrs")?,
         bip110height: conf_num(&map, "bip110height")?,
+        bip110signaling: map.get("bip110signaling").cloned(),
         prune: conf_num(&map, "prune")?,
         datacarrier: conf_bool(&map, "datacarrier")?,
         permitbaremultisig: conf_bool(&map, "permitbaremultisig")?,
@@ -481,6 +498,45 @@ pub(crate) fn parse_network(s: &str) -> anyhow::Result<bitcoin::Network> {
             "unknown network '{other}'; expected mainnet|testnet|testnet4|regtest|signet"
         ),
     }
+}
+
+/// Parse a `--bip110signaling`/`bip110signaling=` value: exactly 8
+/// comma-separated integers `period,bit,start_time,threshold,lockin_floor,
+/// window_lo,window_hi,active_duration`, matching the field order of
+/// [`Bip110Deployment`]. A malformed value is fatal (same rationale as
+/// `conf_num`/`conf_bool` — a config mistake on RDTS enforcement must not
+/// silently fall back to "off").
+pub(crate) fn parse_bip110_signaling(s: &str) -> anyhow::Result<Bip110Deployment> {
+    let parts: Vec<&str> = s.split(',').collect();
+    let [period, bit, start_time, threshold, lockin_floor, window_lo, window_hi, active_duration] =
+        parts.as_slice()
+    else {
+        anyhow::bail!(
+            "invalid --bip110signaling '{s}': expected 8 comma-separated fields \
+             (period,bit,start_time,threshold,lockin_floor,window_lo,window_hi,active_duration), \
+             got {}",
+            parts.len()
+        );
+    };
+    let field = |name: &str, v: &str| -> anyhow::Result<u32> {
+        v.trim()
+            .parse::<u32>()
+            .map_err(|e| anyhow::anyhow!("invalid --bip110signaling field '{name}={v}': {e}"))
+    };
+    Ok(Bip110Deployment {
+        period: field("period", period)?,
+        bit: field("bit", bit)?.try_into().map_err(|_| {
+            anyhow::anyhow!("invalid --bip110signaling field 'bit={bit}': must fit in a u8")
+        })?,
+        start_time: field("start_time", start_time)? as u64,
+        threshold: field("threshold", threshold)?,
+        lock_in_floor_height: field("lockin_floor", lockin_floor)?,
+        mandatory_window: (
+            field("window_lo", window_lo)?,
+            field("window_hi", window_hi)?,
+        ),
+        active_duration: field("active_duration", active_duration)?,
+    })
 }
 
 /// Convert a Bitcoin-style difficulty float to a compact nBits u32.
@@ -619,6 +675,29 @@ mod tests {
         assert_eq!(cfg.permitbaremultisig, None);
         assert_eq!(cfg.datacarriersize, None);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn parse_bip110_signaling_accepts_valid_spec() {
+        // Scaled shape mirroring mainnet: window is the period right before
+        // the lock-in floor, threshold effectively unreachable (mirrors
+        // mainnet's <1% voluntary signaling relying on the mandatory floor).
+        let dep = parse_bip110_signaling("16,4,0,100,112,96,111,32").unwrap();
+        assert_eq!(dep.period, 16);
+        assert_eq!(dep.bit, 4);
+        assert_eq!(dep.start_time, 0);
+        assert_eq!(dep.threshold, 100);
+        assert_eq!(dep.lock_in_floor_height, 112);
+        assert_eq!(dep.mandatory_window, (96, 111));
+        assert_eq!(dep.active_duration, 32);
+    }
+
+    #[test]
+    fn parse_bip110_signaling_rejects_malformed_specs() {
+        assert!(parse_bip110_signaling("16,4,0,100,112,96,111").is_err()); // too few fields
+        assert!(parse_bip110_signaling("16,4,0,100,112,96,111,32,1").is_err()); // too many fields
+        assert!(parse_bip110_signaling("sixteen,4,0,100,112,96,111,32").is_err()); // not a number
+        assert!(parse_bip110_signaling("16,999,0,100,112,96,111,32").is_err()); // bit doesn't fit u8
     }
 
     #[test]

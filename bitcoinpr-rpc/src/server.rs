@@ -1375,10 +1375,23 @@ impl BitcoinRpcServer for RpcServer {
                 .as_secs() as u32;
             let time = now.max(prev_time + 1);
 
+            // BIP-110 signaling: a real (non-fixed) deployment requires blocks to
+            // signal bit 4 while STARTED/LOCKED_IN, and rejects non-signaling
+            // blocks outright inside the mandatory-signaling window (chain.rs). A
+            // hardcoded version here would make the node reject its own
+            // self-mined blocks once that window opens.
+            let version = bitcoinpr_core::bip110_signaling_version(
+                &cs.params,
+                cs.bip110_checker().as_deref(),
+                &cs.header_index,
+                &prev_hash,
+                height,
+            );
+
             // Mine: find a nonce that meets the target
             // For regtest, the target is extremely easy (0x7fffffff...) so nonce=0 almost always works
             let mut header = bitcoin::block::Header {
-                version: BlockVersion::from_consensus(0x20000000),
+                version: BlockVersion::from_consensus(version as i32),
                 prev_blockhash: prev_hash,
                 merkle_root,
                 time,

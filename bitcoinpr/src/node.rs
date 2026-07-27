@@ -72,6 +72,21 @@ fn is_consensus_invalid(e: &bitcoinpr_core::CoreError) -> bool {
     )
 }
 
+/// Which `INVALID_REASON_*` a consensus-invalid block's error message maps
+/// to. The mandatory-signaling error (chain.rs) also contains the substring
+/// "BIP-110", so it must be checked before the generic BIP-110 case —
+/// otherwise a non-signaling block inside the mandatory window is
+/// misclassified as an RDTS rule violation instead of a signaling violation.
+fn invalid_block_reason(error: &str) -> u8 {
+    if error.contains("mandatory-signaling") {
+        bitcoinpr_storage::INVALID_REASON_SIGNALING
+    } else if error.contains("BIP-110") {
+        bitcoinpr_storage::INVALID_REASON_BIP110
+    } else {
+        bitcoinpr_storage::INVALID_REASON_CONSENSUS
+    }
+}
+
 /// After a block on the header-best branch was durably marked invalid, put
 /// the node back on its own chain: repair the height→hash index, reset the
 /// header tip, and — when a failed reorg already disconnected our blocks
@@ -2651,11 +2666,7 @@ impl Node {
                                 // reset the header view back to our chain, and
                                 // reconnect anything a failed reorg already
                                 // disconnected.
-                                let reason = if error.contains("BIP-110") {
-                                    bitcoinpr_storage::INVALID_REASON_BIP110
-                                } else {
-                                    bitcoinpr_storage::INVALID_REASON_CONSENSUS
-                                };
+                                let reason = invalid_block_reason(&error);
                                 error!(
                                     height = expected_height,
                                     hash = %block_hash,
@@ -4050,5 +4061,35 @@ impl Node {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::invalid_block_reason;
+
+    /// Both the mandatory-signaling error and the RDTS rule-violation errors
+    /// contain the substring "BIP-110" — a non-signaling block inside the
+    /// mandatory window must still classify as INVALID_REASON_SIGNALING, not
+    /// INVALID_REASON_BIP110 (an interop-cluster run against a real
+    /// signaling deployment caught this misclassification).
+    #[test]
+    fn invalid_block_reason_distinguishes_signaling_from_rdts() {
+        assert_eq!(
+            invalid_block_reason(
+                "BIP-110: block at height 96 in the mandatory-signaling window must signal bit 4"
+            ),
+            bitcoinpr_storage::INVALID_REASON_SIGNALING
+        );
+        assert_eq!(
+            invalid_block_reason(
+                "BIP-110: output scriptPubKey of 100 bytes exceeds 83 (OP_RETURN)"
+            ),
+            bitcoinpr_storage::INVALID_REASON_BIP110
+        );
+        assert_eq!(
+            invalid_block_reason("bad-txns-inputs-missingorspent"),
+            bitcoinpr_storage::INVALID_REASON_CONSENSUS
+        );
     }
 }

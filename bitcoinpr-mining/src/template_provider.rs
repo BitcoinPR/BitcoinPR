@@ -774,36 +774,30 @@ async fn build_template(
     }
 }
 
-/// BIP-9 base block version (`0x20000000`), with the BIP-110 signaling bit (bit
-/// 4) set while the deployment is STARTED or LOCKED_IN at `next_height` (signaling
-/// stops once ACTIVE/EXPIRED), mirroring Core's `ComputeBlockVersion`. The
-/// deployment state is computed from on-chain signaling (a fresh, uncached
-/// evaluation — templates are infrequent), or from the fixed-mode override.
+/// BIP-110 signaling version for a template at `next_height`. Builds a
+/// throwaway checker (templates are infrequent — the memo cache is only a
+/// speedup, not needed here); see `bitcoinpr_core::bip110_signaling_version`
+/// for the shared logic (also used by the RPC `generatetoaddress` path).
 fn bip110_signaling_version(
     params: &ConsensusParams,
     header_index: &HeaderIndex,
     prev_hash: &BlockHash,
     next_height: u32,
 ) -> u32 {
-    const VERSIONBITS_TOP: u32 = 0x20000000;
-    const BIP110_BIT: u32 = 1 << 4;
-    let checker = params
-        .bip110_deployment
-        .as_ref()
-        .map(|dep| bitcoinpr_core::Bip110Checker::new(dep.clone()));
-    let activation = bitcoinpr_core::bip110_activation_at(
+    // Mirror ChainState::new's precedence: no checker (fixed mode, or no
+    // deployment) when a fixed-mode override is set, even if a deployment
+    // config is also present.
+    let checker = match (&params.bip110_deployment, params.bip110_activation_height) {
+        (Some(dep), None) => Some(bitcoinpr_core::Bip110Checker::new(dep.clone())),
+        _ => None,
+    };
+    bitcoinpr_core::bip110_signaling_version(
         params,
         checker.as_ref(),
         header_index,
         prev_hash,
         next_height,
-    );
-    match activation.state {
-        bitcoinpr_core::ThresholdState::Started | bitcoinpr_core::ThresholdState::LockedIn => {
-            VERSIONBITS_TOP | BIP110_BIT
-        }
-        _ => VERSIONBITS_TOP,
-    }
+    )
 }
 
 /// Build and send a `SetNewPrevHash` + `NewTemplate` pair to a client after a

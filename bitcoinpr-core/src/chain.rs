@@ -263,12 +263,8 @@ impl ChainState {
         // Only applies to the signaling deployment (not the fixed-mode override).
         if let Some(checker) = &self.bip110_checker {
             let dep = checker.deployment();
-            let (lo, hi) = dep.mandatory_window;
-            if bip110.state == crate::bip110::ThresholdState::Started
-                && height >= lo
-                && height <= hi
-                && !dep.signals(block.header.version.to_consensus() as u32)
-            {
+            let version = block.header.version.to_consensus() as u32;
+            if bip110.violates_mandatory_signaling(dep, height, version) {
                 return Err(CoreError::InvalidBlock(format!(
                     "BIP-110: block at height {} in the mandatory-signaling window must signal bit {}",
                     height, dep.bit

@@ -122,6 +122,25 @@ impl Bip110Activation {
     pub fn enforcing(&self) -> bool {
         self.state == ThresholdState::Active
     }
+
+    /// Does this block violate the mandatory-signaling-window rule: the
+    /// deployment is STARTED, `height` falls within `dep.mandatory_window`,
+    /// and `version` does not signal `dep.bit`? Enforced by
+    /// `ChainState::connect_block` — this is the mechanism by which an
+    /// enforcing node and a non-signaling peer can first diverge, at the
+    /// window's opening height (BIP-110: 961632), ahead of lock-in.
+    pub fn violates_mandatory_signaling(
+        &self,
+        dep: &Bip110Deployment,
+        height: u32,
+        version: u32,
+    ) -> bool {
+        let (lo, hi) = dep.mandatory_window;
+        self.state == ThresholdState::Started
+            && height >= lo
+            && height <= hi
+            && !dep.signals(version)
+    }
 }
 
 /// Evaluate the BIP-110 deployment for a block at `height` whose parent is
@@ -143,6 +162,35 @@ pub fn activation_at(
     match checker {
         Some(c) => c.activation_for(header_index, prev_hash, height),
         None => Bip110Activation::INACTIVE,
+    }
+}
+
+/// BIP-9 base block version (`0x2000_0000`), with the deployment's signaling
+/// bit set while the deployment is STARTED or LOCKED_IN at `height` (signaling
+/// stops once ACTIVE/EXPIRED), mirroring Core's `ComputeBlockVersion`. Gated on
+/// `checker` (not `params.bip110_deployment`) so this exactly matches
+/// `ChainState`'s own precedence: a fixed-mode override (`--bip110height`)
+/// disables the checker even if a deployment config is also present, and
+/// fixed mode never checks signaling, so there is nothing to signal.
+///
+/// Every block-producing path (RPC `generatetoaddress`, Stratum/getblocktemplate)
+/// must go through this: a node that mines a non-signaling block of its own
+/// while a real deployment is in its mandatory-signaling window would have
+/// that block rejected by its own `ChainState::connect_block`.
+pub fn signaling_version(
+    params: &crate::consensus::ConsensusParams,
+    checker: Option<&Bip110Checker>,
+    header_index: &HeaderIndex,
+    prev_hash: &BlockHash,
+    height: u32,
+) -> u32 {
+    const VERSIONBITS_TOP: u32 = 0x2000_0000;
+    let activation = activation_at(params, checker, header_index, prev_hash, height);
+    match (activation.state, checker) {
+        (ThresholdState::Started | ThresholdState::LockedIn, Some(c)) => {
+            VERSIONBITS_TOP | (1u32 << c.deployment().bit)
+        }
+        _ => VERSIONBITS_TOP,
     }
 }
 
@@ -510,6 +558,37 @@ mod tests {
         assert_eq!(e.state, ThresholdState::Expired);
         assert_eq!(e.activation_height, Some(12));
         assert!(!e.enforcing());
+    }
+
+    #[test]
+    fn mandatory_signaling_window_rejects_non_signaling_blocks() {
+        // Mirrors the mainnet shape (window = period right before the lock-in
+        // floor): period 4, window (4,7), floor 8. A block inside the window
+        // that doesn't signal violates the rule only while STARTED; outside
+        // the window, or once LOCKED_IN/ACTIVE, non-signaling is fine.
+        let mut dep = test_dep();
+        dep.mandatory_window = (4, 7);
+        let started = Bip110Activation {
+            state: ThresholdState::Started,
+            activation_height: None,
+        };
+        assert!(started.violates_mandatory_signaling(&dep, 4, NO_SIGNAL as u32));
+        assert!(started.violates_mandatory_signaling(&dep, 7, NO_SIGNAL as u32));
+        assert!(!started.violates_mandatory_signaling(&dep, 4, SIGNAL as u32));
+        // Outside the window (even while STARTED), non-signaling is fine.
+        assert!(!started.violates_mandatory_signaling(&dep, 3, NO_SIGNAL as u32));
+        assert!(!started.violates_mandatory_signaling(&dep, 8, NO_SIGNAL as u32));
+        // The rule only fires while STARTED, not once LOCKED_IN/ACTIVE.
+        let locked_in = Bip110Activation {
+            state: ThresholdState::LockedIn,
+            activation_height: Some(8),
+        };
+        assert!(!locked_in.violates_mandatory_signaling(&dep, 5, NO_SIGNAL as u32));
+        let active = Bip110Activation {
+            state: ThresholdState::Active,
+            activation_height: Some(8),
+        };
+        assert!(!active.violates_mandatory_signaling(&dep, 5, NO_SIGNAL as u32));
     }
 
     #[test]

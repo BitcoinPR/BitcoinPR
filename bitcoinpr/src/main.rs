@@ -22,8 +22,8 @@ mod recovery;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use config::{
-    default_rpc_port, difficulty_to_nbits, expand_datadir, load_config, net_subdir, parse_network,
-    Cli,
+    default_rpc_port, difficulty_to_nbits, expand_datadir, load_config, net_subdir,
+    parse_bip110_signaling, parse_network, Cli,
 };
 use node::Node;
 
@@ -94,6 +94,15 @@ async fn main() -> anyhow::Result<()> {
     // and other networks enable/relocate RDTS enforcement for testing.
     if let Some(h) = cli.bip110height.or(conf.bip110height) {
         params.bip110_activation_height = Some(h);
+    }
+    // BIP-110 signaling-deployment override (CLI wins over conf): drives the
+    // real STARTED/LOCKED_IN/ACTIVE state machine from on-chain bit signaling,
+    // for exercising the mandatory-signaling window on regtest. Ignored
+    // whenever --bip110height is also set — ChainState::new only builds the
+    // signaling checker when there's a deployment and NO fixed override, so a
+    // fixed height always wins regardless of this being set too.
+    if let Some(spec) = cli.bip110signaling.clone().or(conf.bip110signaling.clone()) {
+        params.bip110_deployment = Some(parse_bip110_signaling(&spec)?);
     }
     // Knots-style relay-policy knobs (CLI wins over conf; unset keeps the
     // per-network defaults in ConsensusParams). Policy only — blocks
