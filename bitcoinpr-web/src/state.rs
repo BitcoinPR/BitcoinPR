@@ -103,4 +103,9 @@ pub struct WebState {
     pub shutdown_tx: Option<tokio::sync::mpsc::Sender<()>>,
     /// Node shutdown flag, set alongside `shutdown_tx`.
     pub shutting_down: Option<Arc<AtomicBool>>,
+    /// Cached on-disk storage breakdown (component name -> bytes), refreshed
+    /// periodically by a background task rather than walked on every
+    /// `/metrics` scrape (the walk touches every file under the datadir,
+    /// which is too expensive to repeat every ~15s).
+    pub storage_snapshot: Arc<RwLock<Vec<(String, u64)>>>,
 }

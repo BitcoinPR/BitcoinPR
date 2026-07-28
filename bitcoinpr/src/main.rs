@@ -1384,6 +1384,7 @@ async fn main() -> anyhow::Result<()> {
             split_monitor: Some(split_monitor.clone()),
             shutdown_tx: Some(shutdown_tx.clone()),
             shutting_down: Some(shutting_down.clone()),
+            storage_snapshot: Arc::new(tokio::sync::RwLock::new(Vec::new())),
         };
         let web_peers = web_state.peers.clone();
         let web_server = bitcoinpr_web::WebServer::new(web_state, webport);

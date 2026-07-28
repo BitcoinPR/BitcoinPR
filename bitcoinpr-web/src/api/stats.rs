@@ -53,7 +53,7 @@ pub async fn get_peers(State(state): State<WebState>) -> Json<Value> {
     Json(json!({ "peers": *peers }))
 }
 
-fn bits_to_difficulty(bits: u32) -> f64 {
+pub(crate) fn bits_to_difficulty(bits: u32) -> f64 {
     let exponent = (bits >> 24) as i32;
     let mantissa = (bits & 0x00ffffff) as f64;
     if mantissa == 0.0 {

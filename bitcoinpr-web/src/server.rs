@@ -87,6 +87,32 @@ impl WebServer {
             });
         }
 
+        // Spawn the storage-breakdown sampler: every 60s, walk the datadir
+        // (the same walk /api/info does on demand) and cache the result so
+        // /metrics can serve it on every scrape without repeating an
+        // expensive directory walk (Prometheus's default scrape interval is
+        // far shorter than 60s).
+        if let Some(datadir) = self.state.datadir.clone() {
+            let blocks_dir = self.state.blocks_dir.clone();
+            let utxo_set = self.state.utxo_set.clone();
+            let snapshot = self.state.storage_snapshot.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    let datadir = datadir.clone();
+                    let blocks_dir = blocks_dir.clone();
+                    let undo_bytes = utxo_set.cf_disk_sizes().1;
+                    let breakdown = tokio::task::spawn_blocking(move || {
+                        api::info::storage_breakdown(&datadir, blocks_dir.as_deref(), undo_bytes)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    *snapshot.write().await = breakdown;
+                }
+            });
+        }
+
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         info!(addr = %addr, "Web explorer listening");
 
@@ -123,6 +149,7 @@ pub(crate) fn build_router(state: WebState) -> Router {
         .route("/api/split", get(api::split::get_split))
         .route("/api/split/capitulate", post(api::split::capitulate))
         .route("/api/info", get(api::info::get_info))
+        .route("/metrics", get(api::metrics::get_metrics))
         .route("/api/peers", get(api::stats::get_peers))
         .route("/api/mining", get(api::mining::get_mining_stats))
         .route("/api/mining/workers", get(api::mining::get_workers))
@@ -267,6 +294,7 @@ mod tests {
             split_monitor: None,
             shutdown_tx: None,
             shutting_down: None,
+            storage_snapshot: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -414,6 +442,27 @@ mod tests {
             resp.headers().get(header::CACHE_CONTROL).unwrap(),
             "public, max-age=86400"
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_prometheus_text_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = build_router(test_state(dir.path(), None));
+        let resp = router
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; version=0.0.4"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("bitcoinpr_block_height"));
+        assert!(text.contains("bitcoinpr_is_ibd"));
     }
 
     #[tokio::test]

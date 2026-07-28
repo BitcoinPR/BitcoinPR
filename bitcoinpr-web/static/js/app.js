@@ -331,6 +331,7 @@
             case 'NewBlock':
                 showToast('New block #' + (msg.height || ''), 'info');
                 if (currentRoute === '/') refreshDashboard();
+                if (currentRoute === '/info' || currentRoute === '/peers') renderInfo();
                 break;
             case 'NewTx':
                 break;

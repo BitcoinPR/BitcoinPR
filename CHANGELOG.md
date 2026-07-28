@@ -5,6 +5,43 @@ Completed work, newest first (moved from TODO.md on 2026-07-11).
 > Note: `docs/archive/…` paths referenced below were removed from the repo
 > on 2026-07-11; retrieve those documents from git history.
 
+## Prometheus Metrics Endpoint, Grafana Dashboard, Two Web UI Fixes (2026-07-28)
+
+Adds a Prometheus-compatible `GET /metrics` endpoint to the existing web
+explorer (same port, same `web`/`full` feature gate, no new CLI flag) so
+operators with an existing Prometheus/Grafana stack can graph node health and
+blockchain growth over time.
+
+- `bitcoinpr-web/src/api/metrics.rs` — hand-rolled Prometheus text exposition
+  format (no new crate dependency for ~13 metrics), `bitcoinpr_`-prefixed
+  (not `bitcoin_`) so it coexists with a real Bitcoin Core exporter on the
+  same Prometheus. Covers block/header height, difficulty, chain-work
+  (log2), IBD flag, peers, mempool (count/bytes/fee percentiles), on-disk
+  storage by component, tip age, uptime, and mining hashrate.
+- On-disk storage breakdown (the one expensive stat — a recursive datadir
+  walk) is sampled every 60s by a background task in `server.rs` and cached
+  in a new `WebState.storage_snapshot` field, rather than walked on every
+  scrape.
+- `docs/monitoring.md` — scrape config, metric table, and the growth/stall
+  PromQL (`increase(bitcoinpr_block_height[10m])`).
+- `contrib/grafana/bitcoinpr-dashboard.json` — importable dashboard: block
+  height over time, blocks/10m stall detection, stacked on-disk chain size,
+  mempool, peers, difficulty/chain-work, mining hashrate.
+- Fixed along the way: `ShareTracker::hashrate()`
+  (`bitcoinpr-mining/src/shares.rs`) rendered as `-0` whenever the rolling
+  share window was empty or all-rejected — `Sum for f64` uses `-0.0` as its
+  fold identity, which propagated through the hashrate formula into
+  `/metrics`, `/api/mining`, and the web dashboard. Normalized back to
+  `+0.0`.
+- Also fixed: the web UI's `NewBlock` WebSocket handler
+  (`bitcoinpr-web/static/js/app.js`) only refreshed the dashboard route, so
+  the Info page's index-sync progress bars stayed stale until a manual
+  reload. Now mirrors the existing dashboard/mempool/split auto-refresh
+  pattern for the `/info` and `/peers` routes.
+- Gate green (fmt, clippy `-D warnings`, audit, machete, workspace tests);
+  smoke-tested against a live regtest node and the interop cluster's
+  `bitcoinpr1` container.
+
 ## Two New Parasite-Envelope Detectors — "JXL-n-Hide" and "ADVENT" (2026-07-28)
 
 Adds a second and third structural `-rejectparasites` detector alongside the

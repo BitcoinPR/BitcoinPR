@@ -104,7 +104,7 @@ pub async fn get_info(State(state): State<WebState>) -> Json<Value> {
 /// carved out of the directory total into its own "undo" bucket; the
 /// remainder (utxo CF SSTs plus shared WAL/meta files) stays "utxo", so the
 /// two buckets still sum to the directory's real on-disk footprint.
-fn storage_breakdown(
+pub(crate) fn storage_breakdown(
     datadir: &Path,
     blocks_dir: Option<&Path>,
     undo_sst_bytes: u64,
