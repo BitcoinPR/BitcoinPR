@@ -209,6 +209,16 @@ fn check_relay_policy(tx: &Transaction, txid: Txid, params: &ConsensusParams) ->
                 "parasite: input {i} of tx {txid} carries an inscription envelope (rejectparasites=1)"
             )));
         }
+        if let Some(i) = script::tx_first_notif_envelope_input(tx) {
+            return Err(CoreError::InvalidTransaction(format!(
+                "parasite: input {i} of tx {txid} carries a NOTIF dead-branch envelope (rejectparasites=1)"
+            )));
+        }
+        if let Some(i) = script::tx_first_advent_input(tx) {
+            return Err(CoreError::InvalidTransaction(format!(
+                "parasite: input {i} of tx {txid} carries an ADVENT push/drop envelope (rejectparasites=1)"
+            )));
+        }
     }
     if params.reject_tokens {
         if let Some(proto) = script::tx_token_protocol(tx) {
@@ -1893,6 +1903,75 @@ mod tests {
             .expect_err("runestone must be rejected by default")
             .to_string();
         assert!(err.contains("runes"), "got: {err}");
+
+        // JXL-n-Hide-style P2WSH NOTIF dead-branch envelope: rejected as a
+        // parasite by default under the same rejectparasites flag, alongside
+        // (not instead of) the tapscript inscription envelope above.
+        let mut notif_script = vec![0x51, 0x64]; // OP_1 OP_NOTIF
+        for _ in 0..2 {
+            notif_script.push(0x4c); // OP_PUSHDATA1
+            notif_script.push(0xff); // length 255
+            notif_script.extend_from_slice(&[0xaa; 255]);
+        }
+        notif_script.push(0x68); // OP_ENDIF
+        notif_script.push(0x51); // OP_1
+        let mut notif_witness = bitcoin::Witness::new();
+        notif_witness.push(&notif_script);
+        let mut tx = tx_with_outputs(vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array(
+                [0x22; 20],
+            )),
+        }]);
+        tx.input[0].witness = notif_witness;
+        let txid = tx.compute_txid();
+        let err = check_relay_policy(&tx, txid, &ConsensusParams::regtest())
+            .expect_err("NOTIF dead-branch envelope must be rejected by default")
+            .to_string();
+        assert!(
+            err.contains("parasite") && err.contains("NOTIF"),
+            "got: {err}"
+        );
+        let mut params = ConsensusParams::regtest();
+        params.reject_parasites = false;
+        check_relay_policy(&tx, txid, &params).expect("clean with rejectparasites=0");
+
+        // ADVENT push/drop envelope (taproot leaf: <push> OP_DROP repeated,
+        // then a genuine <pubkey> OP_CHECKSIG): rejected as a parasite by
+        // default, same flag as the other two envelope shapes.
+        let mut advent_leaf = Vec::new();
+        for _ in 0..20 {
+            advent_leaf.push(75);
+            advent_leaf.extend_from_slice(&[0xbb; 75]);
+            advent_leaf.push(0x75); // OP_DROP
+        }
+        advent_leaf.push(0x20); // push 32 bytes
+        advent_leaf.extend_from_slice(&[0x03; 32]);
+        advent_leaf.push(0xac); // OP_CHECKSIG
+        let mut control = vec![0xc0];
+        control.extend_from_slice(&[0x02; 32]);
+        let mut advent_witness = bitcoin::Witness::new();
+        advent_witness.push([0u8; 64]);
+        advent_witness.push(&advent_leaf);
+        advent_witness.push(&control);
+        let mut tx = tx_with_outputs(vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array(
+                [0x33; 20],
+            )),
+        }]);
+        tx.input[0].witness = advent_witness;
+        let txid = tx.compute_txid();
+        let err = check_relay_policy(&tx, txid, &ConsensusParams::regtest())
+            .expect_err("ADVENT push/drop envelope must be rejected by default")
+            .to_string();
+        assert!(
+            err.contains("parasite") && err.contains("ADVENT"),
+            "got: {err}"
+        );
+        let mut params = ConsensusParams::regtest();
+        params.reject_parasites = false;
+        check_relay_policy(&tx, txid, &params).expect("clean with rejectparasites=0");
     }
 
     #[test]

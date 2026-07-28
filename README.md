@@ -31,7 +31,7 @@ bitcoinpr-web/          # Embedded web explorer (Axum HTTP/WS)      [optional: -
 - **Chain reorganization** — detects forks via chain work comparison, disconnects stale blocks with UTXO undo (v2 undo data with created outpoints + prev hash for block-store-free rollback), and switches to the heaviest chain
 - **Block validation** — proof-of-work, merkle root, weight limits, full 256-bit difficulty retarget, BIP 34 coinbase, BIP 30 duplicate tx check, sigop counting, witness commitment (BIP 141)
 - **Transaction mempool** — validates against UTXO set, script verification, fee tracking, RBF (BIP 125), ancestor/descendant limits (25/25), persistence across restarts, 2-week expiry
-- **Relay policy filters (Knots-style)** — configurable mempool/relay/mining standardness beyond Core's defaults: `--datacarrier`/`--datacarriersize` (OP_RETURN gating), `--permitbaremultisig` (default 0 — rejects the Stamps/SRC-20 data-embedding vector), `--rejectparasites` (default 1 — rejects inscription envelopes in tapscript witnesses), `--rejecttokens` (default 1 — rejects Runes, Omni, Counterparty, and BRC-20 markers). Policy only: blocks containing filtered transactions still validate, so these can never fork the node. See `docs/relay-policy.md`
+- **Relay policy filters (Knots-style)** — configurable mempool/relay/mining standardness beyond Core's defaults: `--datacarrier`/`--datacarriersize` (OP_RETURN gating), `--permitbaremultisig` (default 0 — rejects the Stamps/SRC-20 data-embedding vector), `--rejectparasites` (default 1 — rejects inscription envelopes in tapscript witnesses, NOTIF dead-branch envelopes in P2WSH witness scripts, and ADVENT push/drop envelopes in either), `--rejecttokens` (default 1 — rejects Runes, Omni, Counterparty, and BRC-20 markers). Policy only: blocks containing filtered transactions still validate, so these can never fork the node. See `docs/relay-policy.md`
 - **Fee estimation** — 20-bucket fee rate estimator (1-10,000 sat/vB) with confirmation rate tracking and adaptive thresholds
 - **Signature cache** — 100k-entry, 64-way sharded cache (wtxid+input+flags keyed) to skip redundant ECDSA/Schnorr verification; random per-shard eviction when full, cleared on a 10k-block cadence
 - **Parallel verification** — rayon thread pool sized to `available_parallelism()`−2 (clamped to ≥2, leaving headroom for the async runtime) for concurrent script execution, batched UTXO prefetch via `batched_multi_get_cf` to warm cache before validation; block validation and mempool signature checks run on `spawn_blocking` threads so the async event loop stays responsive
@@ -343,7 +343,7 @@ bitcoin-cli -rpcport=8332 -rpcuser=bitcoinpr -rpcpassword=bitcoinpr getmininginf
 | `--datacarrier` | 1 | Relay/mine transactions with OP_RETURN outputs; `0` rejects them from the mempool (policy only — see `docs/relay-policy.md`) |
 | `--datacarriersize` | 83 | Max OP_RETURN script size in bytes, including the opcode (Core default 83; Knots uses 42) |
 | `--permitbaremultisig` | 0 | Relay/mine bare (non-P2SH) multisig outputs; `1` restores Bitcoin Core-compatible relay |
-| `--rejectparasites` | 1 | Reject parasitic-protocol transactions (inscription envelopes in tapscript witnesses) |
+| `--rejectparasites` | 1 | Reject parasitic-protocol transactions (inscription envelopes in tapscript witnesses; NOTIF dead-branch envelopes in P2WSH witness scripts; ADVENT push/drop envelopes in either) |
 | `--rejecttokens` | 1 | Reject token-protocol transactions (Runes runestones, Omni/Counterparty payloads, BRC-20 inscriptions) |
 
 ## RPC Methods
