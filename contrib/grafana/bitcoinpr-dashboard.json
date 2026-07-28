@@ -1,0 +1,232 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus datasource that scrapes the bitcoinpr /metrics endpoint",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" },
+    { "type": "panel", "id": "timeseries", "name": "Time series", "version": "" },
+    { "type": "panel", "id": "stat", "name": "Stat", "version": "" }
+  ],
+  "id": null,
+  "uid": "bitcoinpr-node",
+  "title": "BitcoinPR Node",
+  "description": "BitcoinPR node health and blockchain growth, from the node's /metrics endpoint.",
+  "tags": ["bitcoin", "bitcoinpr"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "label": "Prometheus"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Block Height",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "bitcoinpr_block_height", "legendFormat": "height", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "decimals": 0 }, "overrides": [] },
+      "options": { "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 2,
+      "title": "Peers Connected",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "targets": [
+        { "expr": "bitcoinpr_peers_connected", "legendFormat": "peers", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "decimals": 0 }, "overrides": [] },
+      "options": { "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 3,
+      "title": "Mempool Transactions",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "targets": [
+        { "expr": "bitcoinpr_mempool_transactions", "legendFormat": "mempool txs", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "decimals": 0 }, "overrides": [] },
+      "options": { "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 4,
+      "title": "Uptime",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "bitcoinpr_uptime_seconds", "legendFormat": "uptime", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "decimals": 0 }, "overrides": [] },
+      "options": { "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 5,
+      "title": "Initial Block Download",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "targets": [
+        { "expr": "bitcoinpr_is_ibd", "legendFormat": "ibd", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "synced", "color": "green" }, "1": { "text": "syncing", "color": "yellow" } } }
+          ]
+        },
+        "overrides": []
+      },
+      "options": { "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 6,
+      "title": "Tip Age",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "targets": [
+        { "expr": "bitcoinpr_tip_age_seconds", "legendFormat": "tip age", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 3600 },
+              { "color": "red", "value": 7200 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 10,
+      "title": "Block Height Over Time",
+      "description": "Blockchain growth — validated chain tip height.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        { "expr": "bitcoinpr_block_height", "legendFormat": "block height", "refId": "A" },
+        { "expr": "bitcoinpr_header_height", "legendFormat": "header height", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "decimals": 0, "custom": { "drawStyle": "line", "fillOpacity": 0 } }, "overrides": [] }
+    },
+    {
+      "id": 11,
+      "title": "Blocks per 10m (stall detection)",
+      "description": "increase(bitcoinpr_block_height[10m]) — a flat zero for longer than expected means sync has stalled.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        { "expr": "increase(bitcoinpr_block_height[10m])", "legendFormat": "blocks / 10m", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "decimals": 1, "custom": { "drawStyle": "bars", "fillOpacity": 40 } }, "overrides": [] }
+    },
+    {
+      "id": 12,
+      "title": "On-Disk Chain Size by Component",
+      "description": "Literal blockchain-on-disk growth over time.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        { "expr": "bitcoinpr_storage_bytes", "legendFormat": "{{component}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 20, "stacking": { "mode": "normal" } } }, "overrides": [] }
+    },
+    {
+      "id": 13,
+      "title": "Mempool Size",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        { "expr": "bitcoinpr_mempool_transactions", "legendFormat": "transactions", "refId": "A" },
+        { "expr": "bitcoinpr_mempool_bytes", "legendFormat": "bytes", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] }
+    },
+    {
+      "id": 14,
+      "title": "Mempool Fee Rate Percentiles",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [
+        { "expr": "bitcoinpr_mempool_fee_rate_sat_per_vb", "legendFormat": "{{percentile}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "fillOpacity": 0 } }, "overrides": [] }
+    },
+    {
+      "id": 15,
+      "title": "Peer Count",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [
+        { "expr": "bitcoinpr_peers_connected", "legendFormat": "peers", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "decimals": 0, "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] }
+    },
+    {
+      "id": 16,
+      "title": "Difficulty & Chain Work (log2)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "targets": [
+        { "expr": "bitcoinpr_difficulty", "legendFormat": "difficulty", "refId": "A" },
+        { "expr": "bitcoinpr_chain_work_log2", "legendFormat": "chain work (log2)", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 0 } }, "overrides": [] }
+    },
+    {
+      "id": 17,
+      "title": "Mining Hashrate",
+      "description": "Only present while this node's --mining gateway is enabled.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "targets": [
+        { "expr": "bitcoinpr_mining_hashrate", "legendFormat": "hashrate", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Hs", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] }
+    }
+  ]
+}

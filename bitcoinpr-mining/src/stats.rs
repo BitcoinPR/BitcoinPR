@@ -91,6 +91,13 @@ impl MiningDashboard {
         }
     }
 
+    /// Raw estimated hashrate in H/s, unscaled (unlike `snapshot().hashrate`,
+    /// which is scaled to a display unit such as GH/s). For metrics export,
+    /// where a single consistent unit is required across scrapes.
+    pub fn hashrate_hs(&self) -> f64 {
+        self.share_tracker.hashrate()
+    }
+
     /// Per-worker statistics.
     pub async fn workers(&self) -> Vec<WorkerInfo> {
         self.share_tracker

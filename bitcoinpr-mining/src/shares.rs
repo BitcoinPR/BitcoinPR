@@ -127,7 +127,17 @@ impl ShareTracker {
             .map(|s| s.difficulty)
             .sum();
 
-        difficulty_sum * 4_294_967_296.0 / window_secs
+        // `Sum for f64` uses -0.0 as its identity element (the only value
+        // that never flips sign when added), so an empty/all-zero window
+        // yields exactly -0.0 here. Harmless numerically, but ugly wherever
+        // it's displayed (e.g. "-0" in /metrics or the web dashboard) —
+        // normalize it back to +0.0. `== 0.0` is true for both signs.
+        let hashrate = difficulty_sum * 4_294_967_296.0 / window_secs;
+        if hashrate == 0.0 {
+            0.0
+        } else {
+            hashrate
+        }
     }
 
     pub fn accepted(&self) -> u64 {
@@ -246,6 +256,18 @@ mod tests {
         assert_eq!(tracker.accepted(), 2);
         assert_eq!(tracker.rejected(), 1);
         assert!((tracker.best_difficulty() - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_hashrate_with_no_accepted_shares_is_positive_zero() {
+        // `Sum for f64` yields -0.0 for an empty/all-zero window; hashrate()
+        // must normalize that back to +0.0 so it never renders as "-0" in
+        // /metrics or the web dashboard.
+        let tracker = ShareTracker::new();
+        assert_eq!(tracker.hashrate().to_bits(), 0.0_f64.to_bits());
+
+        tracker.record_share("worker1".into(), 1.0, false); // rejected only
+        assert_eq!(tracker.hashrate().to_bits(), 0.0_f64.to_bits());
     }
 
     #[test]
