@@ -101,6 +101,80 @@ transaction crafted to *look* like a script-path spend without being one would
 be policy-rejected — an acceptable false positive for relay purposes, since
 such a transaction is deliberately unusual.
 
+### Parasites: P2WSH NOTIF dead-branch envelopes (`tx_first_notif_envelope_input`)
+
+A second, content-agnostic envelope pattern, structurally analogous to the
+tapscript inscription envelope but built on a plain SegWit v0 (P2WSH) witness
+script instead of a taproot leaf — no BIP-110/tapscript involvement at all:
+
+```
+OP_1 OP_NOTIF <push> <push> … OP_ENDIF OP_1
+```
+
+`OP_1` makes `OP_NOTIF`'s popped condition false, so the guarded block is dead
+code — the same "unreachable branch smuggles data" trick as `OP_FALSE OP_IF`,
+just inverted. This is the construction behind the public "JXL-n-Hide" gist,
+which fragments a JPEG XL image into 255-byte `OP_PUSHDATA1` pushes spread
+across several P2WSH commit outputs, then reassembles them in a reveal
+transaction's raw witness bytes into a valid image container.
+
+Detection is structural, not image-format-specific — it doesn't look for JXL
+container bytes, so it also catches the same envelope carrying any other
+payload:
+
+1. **Recognize the candidate script.** The mempool has no prevouts at `accept`
+   time, so (as with the tapscript envelope) the candidate witness script is
+   identified by shape: the last element of any witness stack with at least
+   one item. For a real P2WSH spend that's always the witness script; for
+   P2WPKH or taproot it's a pubkey/signature/control-block that simply won't
+   open with `OP_1 OP_NOTIF`.
+2. **Match the exact shape.** `OP_1 OP_NOTIF`, then at least two full-width
+   (255-byte, `OP_PUSHDATA1`) pushes, then `OP_ENDIF`, then a closing `OP_1`.
+   The two-push floor and the fixed 255-byte width rule out ordinary small
+   conditional witness scripts; the push *count* is deliberately unbounded
+   above two, since the number of fragments depends on how much data is
+   embedded, not on the gist's specific demo image.
+
+Both parasite detectors are wired to the same `rejectparasites` flag and
+checked independently — a transaction only needs to match one.
+
+### Parasites: ADVENT push/drop envelopes (`tx_first_advent_input`)
+
+**ADVENT** — Arbitrary Data Validly Embedded in Native Transactions — is a
+third envelope shape, distinct from the two dead-branch constructions above:
+instead of guarding data with `OP_IF`/`OP_NOTIF` so it never executes, ADVENT
+pushes data and immediately discards it with `OP_DROP`:
+
+```
+<push> OP_DROP <push> OP_DROP … <push> OP_DROP <pubkey> OP_CHECKSIG
+```
+
+Every instruction genuinely executes — nothing is skipped — but each pushed
+chunk is popped right back off before it can affect anything, so the net
+effect on the stack is zero. The script's actual spend condition is the
+trailing signature check; the push/drop run is inert filler. Real-world
+example: txid `740eb97b05afa26046b0d5b0edcbca2b5a94c84b8ca5170a0246ddaa3261f288`
+is a single taproot script-path spend whose ~100 KB leaf script is nothing but
+`<push> OP_DROP` repeated 1,480 times (embedding a GIF89a image) followed by
+`<pubkey> OP_CHECKSIG`.
+
+Detection, in `advent_payload`:
+
+1. **Recognize the candidate script** in both carrier shapes already used by
+   the other two detectors: a taproot script-path leaf (via
+   `taproot_leaf_script`) and a P2WSH-shaped witness script (the last
+   witness element) — the push/drop trick doesn't depend on script version.
+2. **Count a contiguous run of `<push> OP_DROP` pairs.** A run below
+   `ADVENT_MIN_RUN` (16) is left alone: CLTV/CSV-style covenant scripts
+   commonly use one or two push+drop pairs legitimately, and 16 sits far
+   above that while staying far below what carrying real payload data
+   requires.
+
+Like the other two, this is content-agnostic — it doesn't look for image
+magic bytes, so it also catches the same push/drop trick carrying any other
+payload. All three parasite detectors are wired to `rejectparasites` and
+checked independently.
+
 ### Tokens: protocol markers (`tx_token_protocol`)
 
 The token pattern table, in detection order:

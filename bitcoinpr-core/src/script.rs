@@ -369,6 +369,149 @@ pub fn tx_first_inscription_input(tx: &Transaction) -> Option<usize> {
     })
 }
 
+/// Concatenated payload pushes inside a P2WSH witness script's NOTIF dead
+/// branch (`OP_1 OP_NOTIF <push>… OP_ENDIF OP_1`), or `None` when `script`
+/// doesn't match. `OP_1` makes `OP_NOTIF`'s condition false, so the guarded
+/// block never executes — the same "true branch is empty" trick as the
+/// tapscript inscription envelope above, just built on SegWit v0 witness
+/// scripts instead of a taproot leaf (the "JXL-n-Hide" data-embedding
+/// technique). Requires at least two full-width (255-byte, `OP_PUSHDATA1`)
+/// pushes — an ordinary conditional witness script has no reason to carry
+/// large opaque blobs in a branch that can never run — and the closing
+/// `OP_1` immediately after `OP_ENDIF` that the construction needs to leave
+/// the stack satisfied. The exact push count is deliberately not fixed at
+/// six (the gist's demo image size): any image/data size produces a
+/// different fragment count.
+fn notif_envelope_payload(script: &Script) -> Option<Vec<u8>> {
+    let mut instructions = script.instructions();
+    while let Some(Ok(inst)) = instructions.next() {
+        let is_op1 = matches!(inst, Instruction::Op(op) if op == opcodes::all::OP_PUSHNUM_1);
+        if !is_op1 {
+            continue;
+        }
+        match instructions.next() {
+            Some(Ok(Instruction::Op(op))) if op == opcodes::all::OP_NOTIF => {}
+            _ => continue,
+        }
+        let mut payload = Vec::new();
+        let mut push_count = 0usize;
+        loop {
+            match instructions.next() {
+                Some(Ok(Instruction::PushBytes(data))) if data.len() == 255 => {
+                    payload.extend_from_slice(data.as_bytes());
+                    push_count += 1;
+                }
+                Some(Ok(Instruction::Op(op))) if op == opcodes::all::OP_ENDIF => break,
+                _ => return None,
+            }
+        }
+        if push_count < 2 {
+            return None;
+        }
+        return match instructions.next() {
+            Some(Ok(Instruction::Op(op))) if op == opcodes::all::OP_PUSHNUM_1 => Some(payload),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Index of the first input whose witness carries a P2WSH NOTIF dead-branch
+/// envelope ([`notif_envelope_payload`]) — a second, content-agnostic
+/// `-rejectparasites` marker alongside [`tx_first_inscription_input`]. The
+/// mempool has no prevouts at this point in `accept`, so (as with the
+/// tapscript envelope) the candidate script is recognized structurally: the
+/// last element of any witness stack of at least one item, which is always
+/// the witness script for a real P2WSH spend and something else (a
+/// signature or pubkey) for P2WPKH/taproot — those simply won't match the
+/// `OP_1 OP_NOTIF` opening.
+pub fn tx_first_notif_envelope_input(tx: &Transaction) -> Option<usize> {
+    tx.input.iter().position(|input| {
+        input
+            .witness
+            .last()
+            .map(Script::from_bytes)
+            .and_then(notif_envelope_payload)
+            .is_some()
+    })
+}
+
+/// Minimum number of consecutive `<push> OP_DROP` pairs before
+/// [`advent_payload`] treats the run as data-hiding rather than ordinary
+/// script plumbing. A handful of push+drop pairs is unremarkable (CLTV/CSV
+/// covenant patterns commonly use one); this threshold sits far above any
+/// legitimate use while staying far below what carrying real payload data
+/// requires — the real-world example that motivated this detector
+/// (txid `740eb97b05afa26046b0d5b0edcbca2b5a94c84b8ca5170a0246ddaa3261f288`)
+/// uses 1,480 pairs to embed a ~100 KB GIF.
+const ADVENT_MIN_RUN: usize = 16;
+
+/// Concatenated payload from a run of `<push> OP_DROP` pairs — "ADVENT"
+/// (Arbitrary Data Validly Embedded in Native Transactions): each push
+/// executes for real and is immediately discarded, so unlike the
+/// `OP_IF`/`OP_NOTIF` dead branches above the interpreter actually runs
+/// every instruction, but the net effect on the stack is nothing. The
+/// observed real-world instance is a taproot script-path leaf that is
+/// nothing but `<push> OP_DROP` repeated 1,480 times followed by a genuine
+/// `<pubkey> OP_CHECKSIG` — the signature check is what makes the witness
+/// spend-valid; the drop run is inert filler carrying an embedded GIF.
+/// Returns the first run in `script` reaching [`ADVENT_MIN_RUN`], or `None`.
+fn advent_payload(script: &Script) -> Option<Vec<u8>> {
+    let mut instructions = script.instructions();
+    let mut payload = Vec::new();
+    let mut pairs = 0usize;
+    while let Some(Ok(inst)) = instructions.next() {
+        let Instruction::PushBytes(data) = inst else {
+            if pairs >= ADVENT_MIN_RUN {
+                return Some(payload);
+            }
+            payload.clear();
+            pairs = 0;
+            continue;
+        };
+        match instructions.next() {
+            Some(Ok(Instruction::Op(op))) if op == opcodes::all::OP_DROP => {
+                payload.extend_from_slice(data.as_bytes());
+                pairs += 1;
+            }
+            _ => {
+                if pairs >= ADVENT_MIN_RUN {
+                    return Some(payload);
+                }
+                payload.clear();
+                pairs = 0;
+            }
+        }
+    }
+    if pairs >= ADVENT_MIN_RUN {
+        return Some(payload);
+    }
+    None
+}
+
+/// Index of the first input whose witness carries an ADVENT push/drop
+/// envelope ([`advent_payload`]) — a third, content-agnostic
+/// `-rejectparasites` marker alongside [`tx_first_inscription_input`] and
+/// [`tx_first_notif_envelope_input`]. Checks both carrier shapes already
+/// used above: a taproot script-path leaf and a P2WSH-shaped witness script
+/// (the last witness element), since the push/drop trick doesn't depend on
+/// script version.
+pub fn tx_first_advent_input(tx: &Transaction) -> Option<usize> {
+    tx.input.iter().position(|input| {
+        let taproot_hit = taproot_leaf_script(&input.witness)
+            .map(Script::from_bytes)
+            .and_then(advent_payload)
+            .is_some();
+        let p2wsh_hit = input
+            .witness
+            .last()
+            .map(Script::from_bytes)
+            .and_then(advent_payload)
+            .is_some();
+        taproot_hit || p2wsh_hit
+    })
+}
+
 /// First data push of an OP_RETURN script (the datacarrier payload), or `None`
 /// when there is none or the script doesn't decode.
 fn op_return_payload(script: &Script) -> Option<Vec<u8>> {
@@ -3630,6 +3773,154 @@ mod tests {
         control.extend_from_slice(&[0x02; 32]);
         w.push(&control);
         assert_eq!(tx_first_inscription_input(&tx_with_witness(w)), None);
+    }
+
+    /// JXL-n-Hide-style P2WSH witness script:
+    /// `OP_1 OP_NOTIF <255-byte pushes>… OP_ENDIF OP_1`.
+    fn notif_envelope_witness(chunks: &[[u8; 255]]) -> bitcoin::Witness {
+        let mut script = vec![0x51, 0x64]; // OP_1 OP_NOTIF
+        for chunk in chunks {
+            script.push(0x4c); // OP_PUSHDATA1
+            script.push(0xff); // length 255
+            script.extend_from_slice(chunk);
+        }
+        script.push(0x68); // OP_ENDIF
+        script.push(0x51); // OP_1
+        let mut w = bitcoin::Witness::new();
+        w.push(&script);
+        w
+    }
+
+    #[test]
+    fn test_notif_envelope_detection() {
+        let chunks = [[0xaa; 255], [0xbb; 255]];
+
+        // Two full-width pushes in a NOTIF dead branch: detected on input 0.
+        let tx = tx_with_witness(notif_envelope_witness(&chunks));
+        assert_eq!(tx_first_notif_envelope_input(&tx), Some(0));
+
+        // A single full-width push: below the two-push floor, clean.
+        let one = [[0xaa; 255]];
+        let mut script = vec![0x51, 0x64];
+        script.push(0x4c);
+        script.push(0xff);
+        script.extend_from_slice(&one[0]);
+        script.push(0x68);
+        script.push(0x51);
+        let mut w = bitcoin::Witness::new();
+        w.push(&script);
+        assert_eq!(tx_first_notif_envelope_input(&tx_with_witness(w)), None);
+
+        // Missing the closing OP_1 after OP_ENDIF: not the exact construction, clean.
+        let mut script = vec![0x51, 0x64];
+        for chunk in &chunks {
+            script.push(0x4c);
+            script.push(0xff);
+            script.extend_from_slice(chunk);
+        }
+        script.push(0x68); // OP_ENDIF, no trailing OP_1
+        let mut w = bitcoin::Witness::new();
+        w.push(&script);
+        assert_eq!(tx_first_notif_envelope_input(&tx_with_witness(w)), None);
+
+        // OP_IF instead of OP_NOTIF (a live, not dead, branch): clean.
+        let mut script = vec![0x51, 0x63]; // OP_1 OP_IF
+        for chunk in &chunks {
+            script.push(0x4c);
+            script.push(0xff);
+            script.extend_from_slice(chunk);
+        }
+        script.push(0x68);
+        script.push(0x51);
+        let mut w = bitcoin::Witness::new();
+        w.push(&script);
+        assert_eq!(tx_first_notif_envelope_input(&tx_with_witness(w)), None);
+
+        // Pushes shorter than 255 bytes (ordinary data, not the fixed-width
+        // PUSHDATA1 fragments this construction requires): clean.
+        let mut script = vec![0x51, 0x64];
+        for _ in 0..2 {
+            script.push(0x4c);
+            script.push(0x20); // 32-byte push
+            script.extend_from_slice(&[0xcc; 32]);
+        }
+        script.push(0x68);
+        script.push(0x51);
+        let mut w = bitcoin::Witness::new();
+        w.push(&script);
+        assert_eq!(tx_first_notif_envelope_input(&tx_with_witness(w)), None);
+
+        // P2WPKH-shaped witness (sig + 33-byte pubkey): no false positive.
+        let mut w = bitcoin::Witness::new();
+        w.push([0u8; 72]);
+        w.push([0x02; 33]);
+        assert_eq!(tx_first_notif_envelope_input(&tx_with_witness(w)), None);
+
+        // Plain inscription envelope (tapscript, not P2WSH NOTIF): the two
+        // detectors are independent, this one stays clean.
+        let ord = tx_with_witness(inscription_witness(b"just a picture"));
+        assert_eq!(tx_first_notif_envelope_input(&ord), None);
+    }
+
+    /// ADVENT-style witness script: `<push> OP_DROP` repeated `pairs` times,
+    /// then `<32-byte pubkey> OP_CHECKSIG` — the real spend condition.
+    fn advent_script(pairs: usize, chunk: &[u8]) -> Vec<u8> {
+        let mut script = Vec::new();
+        for _ in 0..pairs {
+            script.push(chunk.len() as u8);
+            script.extend_from_slice(chunk);
+            script.push(0x75); // OP_DROP
+        }
+        script.push(0x20); // push 32 bytes
+        script.extend_from_slice(&[0x03; 32]);
+        script.push(0xac); // OP_CHECKSIG
+        script
+    }
+
+    /// Taproot script-path witness with the given leaf script bytes.
+    fn taproot_witness(leaf: Vec<u8>) -> bitcoin::Witness {
+        let mut control = vec![0xc0];
+        control.extend_from_slice(&[0x02; 32]);
+        let mut w = bitcoin::Witness::new();
+        w.push([0u8; 64]);
+        w.push(&leaf);
+        w.push(&control);
+        w
+    }
+
+    #[test]
+    fn test_advent_envelope_detection() {
+        let chunk = [0xaa; 75];
+
+        // 20 push+drop pairs in a taproot leaf: well above the threshold.
+        let tx = tx_with_witness(taproot_witness(advent_script(20, &chunk)));
+        assert_eq!(tx_first_advent_input(&tx), Some(0));
+
+        // Same shape, but as a bare P2WSH witness script (last witness item).
+        let mut w = bitcoin::Witness::new();
+        w.push(advent_script(20, &chunk));
+        assert_eq!(tx_first_advent_input(&tx_with_witness(w)), Some(0));
+
+        // Only 3 push+drop pairs: a normal covenant-style script, not flagged.
+        let tx = tx_with_witness(taproot_witness(advent_script(3, &chunk)));
+        assert_eq!(tx_first_advent_input(&tx), None);
+
+        // Exactly at the floor (16): detected.
+        let tx = tx_with_witness(taproot_witness(advent_script(16, &chunk)));
+        assert_eq!(tx_first_advent_input(&tx), Some(0));
+
+        // Plain OP_TRUE taproot leaf: clean.
+        let mut w = bitcoin::Witness::new();
+        w.push([0x51]);
+        let mut control = vec![0xc0];
+        control.extend_from_slice(&[0x02; 32]);
+        w.push(&control);
+        assert_eq!(tx_first_advent_input(&tx_with_witness(w)), None);
+
+        // Plain inscription envelope (IF-based, not push/drop): the two
+        // detectors are independent, ADVENT stays clean.
+        let ord = tx_with_witness(inscription_witness(b"just a picture"));
+        assert_eq!(tx_first_advent_input(&ord), None);
     }
 
     #[test]

@@ -5,6 +5,61 @@ Completed work, newest first (moved from TODO.md on 2026-07-11).
 > Note: `docs/archive/…` paths referenced below were removed from the repo
 > on 2026-07-11; retrieve those documents from git history.
 
+## Two New Parasite-Envelope Detectors — "JXL-n-Hide" and "ADVENT" (2026-07-28)
+
+Adds a second and third structural `-rejectparasites` detector alongside the
+existing tapscript inscription-envelope one. Both are content-agnostic
+(neither looks for image magic bytes) and both are wired to the same
+`rejectparasites` flag, checked independently — a transaction only needs to
+match one of the three.
+
+**JXL-n-Hide** (public gist, stevenrabinow-hash) hides a JPEG XL image across
+several P2WSH commit outputs. Each commit witness script is `OP_1 OP_NOTIF
+<255-byte OP_PUSHDATA1 pushes>… OP_ENDIF OP_1` — `OP_1` makes `OP_NOTIF`
+false, so the pushes never execute, and the reveal transaction's raw witness
+bytes reassemble into a valid image container.
+
+- `tx_first_notif_envelope_input` / `notif_envelope_payload` in
+  `bitcoinpr-core/src/script.rs`. Candidate witness script is the last
+  element of any witness stack (a real P2WSH spend's witness script; a
+  P2WPKH/taproot witness's last element won't open with `OP_1 OP_NOTIF`),
+  matched against the exact shape with at least two full-width (255-byte)
+  pushes — deliberately not fixed at the gist's demo count of six, since
+  fragment count scales with embedded data size.
+
+**ADVENT** (Arbitrary Data Validly Embedded in Native Transactions) is a
+distinct carrier found live on-chain (txid
+`740eb97b05afa26046b0d5b0edcbca2b5a94c84b8ca5170a0246ddaa3261f288`): instead
+of a dead branch, it pushes data and immediately discards it with `OP_DROP`
+— `<push> OP_DROP` repeated, ending in a genuine `<pubkey> OP_CHECKSIG` that
+is the script's real spend condition. Every instruction actually executes;
+the push/drop run just nets to nothing on the stack. That txid's leaf script
+is 1,480 push/drop pairs embedding a ~100 KB GIF89a image.
+
+- `tx_first_advent_input` / `advent_payload` in `script.rs`. Checks both
+  carrier shapes already used above (taproot script-path leaf and P2WSH-shaped
+  witness script) since the trick doesn't depend on script version. Flags a
+  contiguous run of at least `ADVENT_MIN_RUN` (16) `<push> OP_DROP` pairs —
+  far above legitimate single/double-drop covenant patterns (CLTV/CSV-style),
+  far below what carrying real payload data requires.
+
+Unlike the two existing parked filters (OP_PLENTY, bare-envelope), neither of
+these techniques has a BIP-110/tapscript dependency (JXL-n-Hide is plain
+SegWit v0; ADVENT is observed on live taproot spends today), so both ship
+enforced immediately rather than parked.
+
+Both new detectors are wired into `rejectparasites` in `mempool.rs` alongside
+`tx_first_inscription_input` (same flag, no new CLI option).
+
+- Tests: `test_notif_envelope_detection` and `test_advent_envelope_detection`
+  (script.rs, each with a positive case and several near-miss negatives) plus
+  end-to-end cases added to `test_parasite_and_token_relay_policy`
+  (mempool.rs).
+- Docs: `docs/relay-policy.md` two new subsections, README feature bullet +
+  CLI table row, `example.bitcoinpr.conf` comment — all updated to describe
+  all three parasite detectors.
+- Gate green, interop 18/18.
+
 ## Validation/IBD Performance Batch, Scripthash Resolver v2, BIP-110 Config Fingerprint (2026-07-20)
 
 Closes the IBD Performance backlog (all 8 items from the Core PR #32043
