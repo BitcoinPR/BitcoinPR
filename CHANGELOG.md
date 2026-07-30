@@ -1,9 +1,37 @@
 # BitcoinPR — Changelog
 
-Completed work, newest first (moved from TODO.md on 2026-07-11).
+Completed work, newest first.
 
-> Note: `docs/archive/…` paths referenced below were removed from the repo
-> on 2026-07-11; retrieve those documents from git history.
+## Three Live Parasite-Filter Evasions Closed (2026-07-30)
+
+Three real, confirmed mainnet transactions evaded every existing
+`-rejectparasites` detector. All three are fixed in `bitcoinpr-core/src/script.rs`,
+independent of BIP-110 state like the existing detectors.
+
+- **`notif_envelope_payload` partial trailing chunk** — the JXL-n-Hide detector
+  required every push in the dead `OP_1 OP_NOTIF` branch to be exactly 255
+  bytes. A real on-chain PDF (txid `07b7b583…`, 109 witness inputs) has a
+  254-byte remainder as its last chunk and slipped through. Now accepts a
+  single trailing push shorter than 255 bytes closing the run, provided at
+  least two full-width pushes came before it.
+- **`advent_payload` batched drops** — the ADVENT detector required each push
+  to be immediately followed by its own `OP_DROP`. A real on-chain MP4 (txid
+  `06214483…`) instead pushes ~1,176 chunks and drops them all in one trailing
+  batch, beating the adjacency check. Reworked to track `pending` pushes not
+  yet matched by a drop rather than requiring push/drop pairs, so an "N pushes
+  then N drops" run matches too; also handles `OP_2DROP`.
+- **New detector: witness-stack-argument drops** — payload smuggled as
+  witness-stack arguments (rather than script pushdata) discarded by a bare
+  `OP_DROP` had no detector at all, since the data never touches the script's
+  own pushes. A real on-chain WebAssembly module (txid `a3ab3bed…`) used this
+  carrier. New `tx_first_witness_arg_drop_input` (+ `bare_drop_run`,
+  `taproot_arg_count` helpers, `WITNESS_ARG_DROP_MIN_RUN = 8`) wired into
+  `check_relay_policy` as a fourth `rejectparasites` marker.
+
+Verified against the actual on-chain witness bytes for all three txids (not
+synthetic reconstructions), 18/18 interop, and live `sendrawtransaction`
+rejection confirmed on a running node. Docs (`docs/relay-policy.md`) updated
+for all four detectors now covered by `rejectparasites`.
 
 ## Prometheus Metrics Endpoint, Grafana Dashboard, Two Web UI Fixes (2026-07-28)
 

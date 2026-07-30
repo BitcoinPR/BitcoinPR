@@ -133,7 +133,14 @@ payload:
    The two-push floor and the fixed 255-byte width rule out ordinary small
    conditional witness scripts; the push *count* is deliberately unbounded
    above two, since the number of fragments depends on how much data is
-   embedded, not on the gist's specific demo image.
+   embedded, not on the gist's specific demo image. A single trailing push
+   shorter than 255 bytes (any length 1-254) is also accepted as the run's
+   last fragment, immediately before `OP_ENDIF` — real payload lengths are
+   essentially never an exact multiple of 255, so the final fragment is
+   ordinarily a remainder shorter than the rest. (Real-world instance: txid
+   `07b7b58348581d91da90fc42150152014a1cd81c932204caf7f3de2bac789f5d`, a PDF
+   whose last of six fragments is 254 bytes — the original implementation,
+   requiring every push to be exactly 255 bytes, missed it entirely.)
 
 Both parasite detectors are wired to the same `rejectparasites` flag and
 checked independently — a transaction only needs to match one.
@@ -164,16 +171,65 @@ Detection, in `advent_payload`:
    the other two detectors: a taproot script-path leaf (via
    `taproot_leaf_script`) and a P2WSH-shaped witness script (the last
    witness element) — the push/drop trick doesn't depend on script version.
-2. **Count a contiguous run of `<push> OP_DROP` pairs.** A run below
-   `ADVENT_MIN_RUN` (16) is left alone: CLTV/CSV-style covenant scripts
-   commonly use one or two push+drop pairs legitimately, and 16 sits far
-   above that while staying far below what carrying real payload data
-   requires.
+2. **Count pushes fully consumed by drops.** Rather than requiring each push
+   to be *immediately* followed by its `OP_DROP`, the matcher tracks
+   `pending` — the number of in-script pushes not yet matched by a drop —
+   so a run below `ADVENT_MIN_RUN` (16) matched drops is left alone:
+   CLTV/CSV-style covenant scripts commonly use one or two push+drop pairs
+   legitimately, and 16 sits far above that while staying far below what
+   carrying real payload data requires. Tracking `pending` instead of exact
+   adjacency also catches a *batched* variant — all the pushes first, then
+   all the drops in one trailing run — which an adjacency-only matcher
+   misses even though the net stack effect is identical. (Real-world
+   instance: txid
+   `06214483dcbf9f2025f9709aa5a7dce85277a8ce15076d2d0029f3d64f4bc7b6`, an
+   MP4 pushed as ~1,176 chunks followed by ~1,176 `OP_DROP`s in a single
+   batch, not interleaved — the original interleaved-only implementation
+   missed it entirely.) `OP_2DROP` is tracked the same way, two at a time. A
+   drop with nothing pending — an argument the *witness* supplied rather
+   than something the script just pushed — breaks the run just like any
+   other non-matching instruction; see the witness-argument detector below
+   for that case.
 
 Like the other two, this is content-agnostic — it doesn't look for image
 magic bytes, so it also catches the same push/drop trick carrying any other
-payload. All three parasite detectors are wired to `rejectparasites` and
+payload. All four parasite detectors are wired to `rejectparasites` and
 checked independently.
+
+### Parasites: witness-argument drops (`tx_first_witness_arg_drop_input`)
+
+A fourth envelope shape, distinct from ADVENT in one key way: the payload
+never appears as a push *inside* the script at all. Instead it rides in as
+separate witness-stack **arguments** alongside the script, which the script
+discards with bare `OP_DROP`s that have no corresponding push of their own:
+
+```
+witness: [<64-80 byte arg> × 14, <leaf script>, <control block>]
+leaf script: OP_DROP × 13 <pubkey> OP_CHECKSIG
+```
+
+Since the hidden bytes never touch the script's bytecode, this is cheaper
+for an attacker than ADVENT — no push opcode or length byte overhead per
+hidden byte — so `WITNESS_ARG_DROP_MIN_RUN` (8) sits lower than
+`ADVENT_MIN_RUN`, while still comfortably above the one-or-two bare drops an
+ordinary covenant script needs. Real-world instance: txid
+`a3ab3bed82e5052dcb69978a5254325f2c53259bbb54870bb21cd298ccdc135d` hides a
+WebAssembly module as 14 witness arguments discarded by 13 `OP_DROP`s ahead
+of a real signature check.
+
+Detection, in `bare_drop_run` / `tx_first_witness_arg_drop_input`:
+
+1. **Recognize the candidate script** in both carrier shapes the other
+   detectors use: a taproot script-path leaf and a P2WSH-shaped witness
+   script (the last witness element).
+2. **Count a run of consecutive bare `OP_DROP`/`OP_2DROP`** — one not
+   immediately preceded by a same-script push, which rules out ordinary
+   in-script cleanup (already ADVENT's concern).
+3. **Confirm enough witness arguments exist to supply the run** — the
+   leading witness elements before the leaf script and control block (minus
+   any BIP 341 annex) must be at least as numerous as the drop run, so a
+   script with a long bare-drop run but no matching external arguments
+   (which couldn't spend honestly anyway) isn't over-read.
 
 ### Tokens: protocol markers (`tx_token_protocol`)
 
