@@ -219,6 +219,11 @@ fn check_relay_policy(tx: &Transaction, txid: Txid, params: &ConsensusParams) ->
                 "parasite: input {i} of tx {txid} carries an ADVENT push/drop envelope (rejectparasites=1)"
             )));
         }
+        if let Some(i) = script::tx_first_witness_arg_drop_input(tx) {
+            return Err(CoreError::InvalidTransaction(format!(
+                "parasite: input {i} of tx {txid} smuggles payload as dropped witness arguments (rejectparasites=1)"
+            )));
+        }
     }
     if params.reject_tokens {
         if let Some(proto) = script::tx_token_protocol(tx) {
