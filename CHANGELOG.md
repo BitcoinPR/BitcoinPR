@@ -33,6 +33,29 @@ synthetic reconstructions), 18/18 interop, and live `sendrawtransaction`
 rejection confirmed on a running node. Docs (`docs/relay-policy.md`) updated
 for all four detectors now covered by `rejectparasites`.
 
+## Fix tapscript codesep_pos counter skipping control-flow opcodes (2026-08-04)
+
+Block 960985 was rejected with `OP_CHECKSIGVERIFY failed in tapscript` and the
+node fell behind the network by 50+ blocks.
+
+**Root cause:** the tapscript interpreter's `opcode_pos` counter — used to set
+`codesep_pos` for BIP 342 sighash computation — was not incremented for
+`OP_IF`, `OP_NOTIF`, `OP_ELSE`, `OP_ENDIF`, or any opcode in a non-executing
+branch.  All five code paths used `continue` to skip to the next loop
+iteration, bypassing the `opcode_pos += 1` at the bottom of the loop.
+
+Scripts that never use `OP_CODESEPARATOR` (or use it without conditional
+branches) were unaffected because `codesep_pos` stayed at its initial
+`0xFFFFFFFF`.  The first mainnet transaction to expose the bug was a complex
+multi-key tapscript with `OP_IF/OP_ELSE` and `OP_CODESEPARATOR` in both
+branches — the miscounted position produced an incorrect sighash, failing
+Schnorr verification.
+
+**Fix:** add `opcode_pos += 1` before each of the five `continue` statements
+in `execute_tapscript` (`bitcoinpr-core/src/script.rs`), matching Bitcoin
+Core's behaviour of counting every instruction including control-flow opcodes
+and opcodes in unexecuted branches.
+
 ## Prometheus Metrics Endpoint, Grafana Dashboard, Two Web UI Fixes (2026-07-28)
 
 Adds a Prometheus-compatible `GET /metrics` endpoint to the existing web
