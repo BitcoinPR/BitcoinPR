@@ -4430,13 +4430,19 @@ mod tests {
             false,
             &mut SighashCache::new(&tx),
         );
-        assert!(result.is_ok(), "tapscript with IF/CODESEP failed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "tapscript with IF/CODESEP failed: {result:?}"
+        );
         // Stack should have OP_1 on top (from pos 7); OP_1 from pos 2 is
         // consumed by OP_IF, and the OP_1 from OP_IF's true branch stays.
         // Actually: after OP_IF consumes the OP_1, the true branch pushes
         // OP_1 (pos 2), then OP_CODESEPARATOR is a no-op, then OP_1 (pos 7).
         assert_eq!(stack.len(), 2, "expected 2 items on stack, got {stack:?}");
-        assert!(cast_to_bool(&stack[stack.len() - 1]), "top of stack should be truthy");
+        assert!(
+            cast_to_bool(&stack[stack.len() - 1]),
+            "top of stack should be truthy"
+        );
     }
 
     fn spend_witness_program(

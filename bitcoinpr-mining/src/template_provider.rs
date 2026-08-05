@@ -1097,13 +1097,75 @@ async fn handle_v1_session(
     let extranonce1_hex = hex::encode(extranonce1);
     let extranonce2_size: usize = 4;
 
-    // --- Handle mining.subscribe ---
-    if first_msg.method != "mining.subscribe" {
-        anyhow::bail!("Expected mining.subscribe, got {}", first_msg.method);
-    }
+    // --- Handle mining.subscribe (allow mining.configure before it) ---
+    // Some miners (e.g. Avalon Nano3s) send mining.configure before
+    // mining.subscribe per BIP 310.  Accept pre-subscribe configure messages
+    // and then wait for the actual subscribe.
+    let subscribe_id = if first_msg.method == "mining.subscribe" {
+        first_msg.id
+    } else {
+        // Handle pre-subscribe messages until we get mining.subscribe
+        let mut pending = Some(first_msg);
+        let sid;
+        loop {
+            let rpc = if let Some(p) = pending.take() {
+                p
+            } else {
+                let line = match lines.next_line().await? {
+                    Some(l) => l,
+                    None => return Ok(()),
+                };
+                serde_json::from_str::<JsonRpcRequest>(&line)?
+            };
+            match rpc.method.as_str() {
+                "mining.subscribe" => {
+                    sid = rpc.id;
+                    break;
+                }
+                "mining.configure" => {
+                    // BIP 310 — acknowledge version-rolling (pre-subscribe)
+                    let mut result = json!({});
+                    if let Some(params) = rpc.params.as_array() {
+                        if let Some(extensions) = params.first().and_then(|v| v.as_array()) {
+                            for ext in extensions {
+                                if ext.as_str() == Some("version-rolling") {
+                                    result["version-rolling"] = json!(true);
+                                    result["version-rolling.mask"] = json!("1fffe000");
+                                    result["version-rolling.min-bit-count"] = json!(0);
+                                }
+                            }
+                        }
+                    }
+                    send_json(
+                        writer,
+                        &JsonRpcResponse {
+                            id: rpc.id,
+                            result: json!(result),
+                            error: None,
+                        },
+                    )
+                    .await?;
+                    debug!(%addr, "V1 mining.configure acknowledged (pre-subscribe)");
+                }
+                other => {
+                    debug!(%addr, method = other, "Unexpected method before subscribe, acking");
+                    send_json(
+                        writer,
+                        &JsonRpcResponse {
+                            id: rpc.id,
+                            result: json!(true),
+                            error: None,
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        sid
+    };
 
     let subscribe_resp = JsonRpcResponse {
-        id: first_msg.id,
+        id: subscribe_id,
         result: json!([
             [["mining.set_difficulty", "1"], ["mining.notify", "1"]],
             extranonce1_hex,
